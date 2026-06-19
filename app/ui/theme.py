@@ -266,11 +266,15 @@ def set_titlebar_color(window, palette) -> bool:
 
 
 def _dwm_set_caption_color(window_handle: int, hex_color: str) -> bool:
-    """Windows 10 1809+：用 DWM API 给原生标题栏上色。
+    """Windows 10 1809+ / Windows 11：用 DWM API 给原生标题栏上色。
 
-    通过 DwmSetWindowAttribute(DWMWA_CAPTION_COLOR=35) 设置标题栏背景，
-    以及 DWMWA_TEXT_COLOR=36 设置标题文字色。只改颜色，不重写标题栏本身，
-    保留最小化/最大化/关闭按钮与拖拽等系统行为。
+    关键三步（缺一不可，否则标题栏仍为系统默认白色/灰色）：
+    1. DWMWA_USE_IMMERSIVE_DARK_MODE(20)=1：开启沉浸式模式，
+       这是 CAPTION_COLOR 生效的前提（Win10 1809+/Win11）。
+    2. DWMWA_CAPTION_COLOR(35)：标题栏背景色。
+    3. DWMWA_TEXT_COLOR(36)：标题文字色。
+    最后调 SetWindowPos(SWP_FRAMECHANGED) 强制重绘非客户区。
+
     返回是否成功（非 Windows / 旧版本 / 句柄无效时返回 False，静默忽略）。
     """
     if os.name != "nt":
@@ -280,22 +284,35 @@ def _dwm_set_caption_color(window_handle: int, hex_color: str) -> bool:
         from ctypes import wintypes
 
         dwmapi = ctypes.WinDLL("dwmapi")
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
         DWMWA_CAPTION_COLOR = 35
         DWMWA_TEXT_COLOR = 36
 
         h = wintypes.HWND(window_handle)
-        h_res = wintypes.HRESULT()
-
-        # 标题栏背景色
+        # 1. 开启沉浸式暗色模式（自定义标题色的前提）
+        dwmapi.DwmSetWindowAttribute(
+            h, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int),
+        )
+        # 2. 标题栏背景色
         bg = _hex_to_colorref(hex_color)
         dwmapi.DwmSetWindowAttribute(
             h, DWMWA_CAPTION_COLOR,
             ctypes.byref(ctypes.c_uint(bg)), ctypes.sizeof(ctypes.c_uint),
         )
-        # 标题文字色：用纯白，与深色面板背景对比
+        # 3. 标题文字色：纯白，与深色面板背景对比
         dwmapi.DwmSetWindowAttribute(
             h, DWMWA_TEXT_COLOR,
             ctypes.byref(ctypes.c_uint(0x00FFFFFF)), ctypes.sizeof(ctypes.c_uint),
+        )
+        # 强制重绘非客户区（标题栏），否则改动不可见
+        user32 = ctypes.WinDLL("user32")
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_FRAMECHANGED = 0x0020
+        user32.SetWindowPos(
+            h, None, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED,
         )
         return True
     except Exception:
