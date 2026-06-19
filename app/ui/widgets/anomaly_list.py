@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
 )
 
 from app.ui.theme import get_palette
+from app.ui.widgets.svg_icon import load_svg_icon, load_svg_pixmap
 from app.utils.image_convert import ndarray_bgr_to_qpixmap
 
 THUMB_W = 160
@@ -89,6 +90,7 @@ class AnomalyList(QWidget):
 
     def set_palette(self, palette) -> None:
         self._palette = palette
+        self._render_placeholder()
         self._update_placeholder()
 
     def _build(self) -> None:
@@ -106,6 +108,7 @@ class AnomalyList(QWidget):
         header.addWidget(self._count)
         self._clear_btn = QPushButton("清空")
         self._clear_btn.setProperty("role", "flat")
+        self._clear_btn.setIcon(load_svg_icon("trash", self._palette.fg_main, 16))
         self._clear_btn.clicked.connect(self.clear)
         header.addWidget(self._clear_btn)
         layout.addLayout(header)
@@ -122,10 +125,26 @@ class AnomalyList(QWidget):
         self._scroll.setWidget(self._container)
         layout.addWidget(self._scroll, 1)
 
-        self._placeholder = QLabel("尚无异常帧")
+        self._placeholder = QLabel()
         self._placeholder.setAlignment(Qt.AlignCenter)
         self._placeholder.setProperty("role", "sub")
+        self._render_placeholder()
         self._row.insertWidget(0, self._placeholder)
+
+    def _render_placeholder(self) -> None:
+        """空状态：插画 + 文字（富文本，跟随主题色）。"""
+        import base64 as _b64
+        from PyQt5.QtCore import QBuffer as _QBuffer
+        pm = load_svg_pixmap("empty_box", self._palette.fg_sub, 56)
+        buf = _QBuffer()
+        buf.open(_QBuffer.ReadWrite)
+        pm.save(buf, "PNG")
+        b64 = _b64.b64encode(bytes(buf.data())).decode("ascii")
+        self._placeholder.setText(
+            f"<div style='text-align:center;'>"
+            f"<img src='data:image/png;base64,{b64}'/>"
+            f"<br><span style='color:{self._palette.fg_sub};'>尚无异常帧</span></div>"
+        )
 
     def _update_placeholder(self) -> None:
         self._placeholder.setVisible(len(self._items) == 0)

@@ -3,10 +3,13 @@ from __future__ import annotations
 
 from enum import Enum
 
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtCore import QSize, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QPushButton, QComboBox, QLabel, QSpinBox, QFileDialog,
 )
+
+from app.ui.theme import get_palette
+from app.ui.widgets.svg_icon import load_svg_icon
 
 
 class SourceType(Enum):
@@ -34,6 +37,7 @@ class ControlBar(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(8)
+        pal = get_palette()
 
         # 源类型按钮组
         self.btn_camera = QPushButton("摄像头")
@@ -42,6 +46,10 @@ class ControlBar(QWidget):
         for b in (self.btn_camera, self.btn_image, self.btn_video):
             b.setCheckable(True)
             b.setProperty("role", "flat")
+            b.setIconSize(QSize(16, 16))
+        self.btn_camera.setIcon(load_svg_icon("camera", pal.fg_main, 16))
+        self.btn_image.setIcon(load_svg_icon("image", pal.fg_main, 16))
+        self.btn_video.setIcon(load_svg_icon("video", pal.fg_main, 16))
         self.btn_camera.setChecked(True)
         self.btn_camera.clicked.connect(lambda: self._switch(SourceType.CAMERA))
         self.btn_image.clicked.connect(lambda: self._switch_image())
@@ -70,6 +78,11 @@ class ControlBar(QWidget):
         self.btn_start = QPushButton("开始")
         self.btn_pause = QPushButton("暂停")
         self.btn_stop = QPushButton("停止")
+        for b in (self.btn_start, self.btn_pause, self.btn_stop):
+            b.setIconSize(QSize(16, 16))
+        self.btn_start.setIcon(load_svg_icon("start", "#FFFFFF", 16))
+        self.btn_pause.setIcon(load_svg_icon("pause", "#FFFFFF", 16))
+        self.btn_stop.setIcon(load_svg_icon("stop", "#FFFFFF", 16))
         self.btn_pause.setEnabled(False)
         self.btn_stop.setEnabled(False)
         self.btn_start.clicked.connect(self._on_start)

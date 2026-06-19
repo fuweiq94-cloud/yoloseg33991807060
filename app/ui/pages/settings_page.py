@@ -17,10 +17,12 @@ from PyQt5.QtWidgets import (
 
 from app.core.config_manager import ConfigManager
 from app.ui.pages.base_page import BasePage
+from app.ui.widgets.svg_icon import load_svg_icon
 
 
 class SettingsPage(BasePage):
     title = "设置"
+    icon_name = "settings"
 
     settings_applied = pyqtSignal()
 
@@ -34,11 +36,14 @@ class SettingsPage(BasePage):
         bar.addStretch(1)
         self.btn_reload = QPushButton("重新载入")
         self.btn_reload.setProperty("role", "flat")
+        self.btn_reload.setIcon(load_svg_icon("refresh", self.palette.fg_main, 16))
         self.btn_reload.clicked.connect(self._reload)
         self.btn_reset = QPushButton("恢复默认")
         self.btn_reset.setProperty("role", "flat")
+        self.btn_reset.setIcon(load_svg_icon("undo", self.palette.fg_main, 16))
         self.btn_reset.clicked.connect(self._reset_defaults)
         self.btn_apply = QPushButton("应用")
+        self.btn_apply.setIcon(load_svg_icon("check", "#FFFFFF", 16))
         self.btn_apply.clicked.connect(self._apply)
         bar.addWidget(self.btn_reload)
         bar.addWidget(self.btn_reset)
@@ -75,6 +80,7 @@ class SettingsPage(BasePage):
         self.det_model = QLineEdit()
         self.det_model_btn = QPushButton("浏览")
         self.det_model_btn.setProperty("role", "flat")
+        self.det_model_btn.setIcon(load_svg_icon("folder_open", self.palette.fg_main, 16))
         self.det_model_btn.clicked.connect(self._pick_model)
         f.addWidget(self.det_model, row, 1)
         f.addWidget(self.det_model_btn, row, 2)
@@ -147,6 +153,7 @@ class SettingsPage(BasePage):
         self.alm_sound_file = QLineEdit()
         self.alm_sound_btn = QPushButton("浏览")
         self.alm_sound_btn.setProperty("role", "flat")
+        self.alm_sound_btn.setIcon(load_svg_icon("folder_open", self.palette.fg_main, 16))
         self.alm_sound_btn.clicked.connect(self._pick_sound)
         f.addWidget(self.alm_sound_file, row, 1)
         f.addWidget(self.alm_sound_btn, row, 2)
@@ -210,6 +217,7 @@ class SettingsPage(BasePage):
         self.p_snap = QLineEdit()
         self.p_snap_btn = QPushButton("浏览")
         self.p_snap_btn.setProperty("role", "flat")
+        self.p_snap_btn.setIcon(load_svg_icon("folder_open", self.palette.fg_main, 16))
         self.p_snap_btn.clicked.connect(lambda: self._pick_dir(self.p_snap))
         f.addWidget(self.p_snap, row, 1)
         f.addWidget(self.p_snap_btn, row, 2)
@@ -219,6 +227,7 @@ class SettingsPage(BasePage):
         self.p_clip = QLineEdit()
         self.p_clip_btn = QPushButton("浏览")
         self.p_clip_btn.setProperty("role", "flat")
+        self.p_clip_btn.setIcon(load_svg_icon("folder_open", self.palette.fg_main, 16))
         self.p_clip_btn.clicked.connect(lambda: self._pick_dir(self.p_clip))
         f.addWidget(self.p_clip, row, 1)
         f.addWidget(self.p_clip_btn, row, 2)
@@ -228,6 +237,7 @@ class SettingsPage(BasePage):
         self.p_log = QLineEdit()
         self.p_log_btn = QPushButton("浏览")
         self.p_log_btn.setProperty("role", "flat")
+        self.p_log_btn.setIcon(load_svg_icon("folder_open", self.palette.fg_main, 16))
         self.p_log_btn.clicked.connect(lambda: self._pick_dir(self.p_log))
         f.addWidget(self.p_log, row, 1)
         f.addWidget(self.p_log_btn, row, 2)

@@ -17,6 +17,7 @@ from app.ui.widgets.anomaly_list import AnomalyList, AnomalyItem
 
 class StatsPage(BasePage):
     title = "统计与异常帧"
+    icon_name = "stats"
 
     def _build_content(self) -> None:
         split = QSplitter(Qt.Vertical)

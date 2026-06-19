@@ -20,8 +20,7 @@ from datetime import datetime
 
 import numpy as np
 from PyQt5.QtCore import Qt, QTimer, QSize, pyqtSignal
-from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor
-from PyQt5.QtSvg import QSvgRenderer
+from PyQt5.QtGui import QIcon, QColor
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel,
     QPushButton, QListWidget, QListWidgetItem, QStackedWidget,
@@ -342,27 +341,13 @@ class MainWindow(QMainWindow):
         """从 assets/icons/<name>.svg 加载图标，按主题着色。
 
         selected=True 用白色（与蓝色选中背景对比），否则用次文字色（默认态）。
-        SVG 用 stroke=currentColor，通过替换字符串注入目标颜色。
         注意：选中项背景已是主题色（self._palette.primary），图标不能用同色，
         否则蓝图标画在蓝背景上会"隐形"——此处用 #FFFFFF 保证可见。
         """
-        svg_path = os.path.join(self._project_root, "assets", "icons", f"{name}.svg")
+        from app.ui.widgets.svg_icon import load_svg_icon
         color = "#FFFFFF" if selected else self._palette.fg_sub
-        try:
-            with open(svg_path, "r", encoding="utf-8") as f:
-                svg = f.read()
-            svg = svg.replace("currentColor", color)
-            renderer = QSvgRenderer(svg.encode("utf-8"))
-            size = getattr(self, "_nav_icon_px", 28)
-            pm = QPixmap(size, size)
-            pm.fill(Qt.transparent)
-            painter = QPainter(pm)
-            renderer.render(painter)
-            painter.end()
-            return QIcon(pm)
-        except OSError:
-            logger.warning("导航图标缺失: %s", svg_path)
-            return QIcon()
+        size = getattr(self, "_nav_icon_px", 28)
+        return load_svg_icon(name, color, size)
 
     def _build_statusbar(self) -> None:
         sb = self.statusBar()

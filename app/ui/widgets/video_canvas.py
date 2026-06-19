@@ -9,10 +9,11 @@ ROI 坐标以"原始帧像素"存储，缩放显示时实时换算，保证缩�
 """
 from __future__ import annotations
 
+import base64
 from typing import List, Tuple
 
 import numpy as np
-from PyQt5.QtCore import Qt, pyqtSignal, QPoint, QPointF, QSize
+from PyQt5.QtCore import Qt, pyqtSignal, QPoint, QPointF, QSize, QBuffer
 from PyQt5.QtGui import (
     QPixmap, QImage, QPainter, QPen, QBrush, QColor, QPolygonF, QFont,
     QMouseEvent, QKeyEvent, QPaintEvent, QResizeEvent,
@@ -20,6 +21,7 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import QLabel, QWidget
 
 from app.ui.theme import get_palette
+from app.ui.widgets.svg_icon import load_svg_pixmap
 
 
 class VideoCanvas(QLabel):
@@ -62,8 +64,20 @@ class VideoCanvas(QLabel):
 
     # ---- 占位提示 ----
     def _show_placeholder(self) -> None:
-        self.setText("请选择数据源并开始检测")
-        self.setStyleSheet(f"color: {self._palette.fg_sub}; background-color: {self._palette.canvas};")
+        """空状态：居中显示插画 + 提示文字（富文本 HTML 内嵌 base64 PNG）。"""
+        pm = load_svg_pixmap("empty_box", self._palette.fg_sub, 72)
+        buf = QBuffer()
+        buf.open(QBuffer.ReadWrite)
+        pm.save(buf, "PNG")
+        b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+        html = (
+            f"<div style='text-align:center;'>"
+            f"<img src='data:image/png;base64,{b64}'/>"
+            f"<br><span style='color:{self._palette.fg_sub}; font-size:13px;'>"
+            f"请选择数据源并开始检测</span></div>"
+        )
+        self.setText(html)
+        self.setStyleSheet(f"background-color: {self._palette.canvas};")
 
     # ---- 公共接口 ----
     def update_frame(self, frame_bgr: np.ndarray) -> None:

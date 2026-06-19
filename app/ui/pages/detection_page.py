@@ -21,6 +21,7 @@ from app.ui.widgets.class_filter import ClassFilter
 
 class DetectionPage(BasePage):
     title = "检测"
+    icon_name = "detection"
 
     # 用户改了勾选类别 -> 通知 MainWindow 同步到 detector
     classes_changed = pyqtSignal(list)

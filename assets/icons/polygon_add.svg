@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 多边形 + 加号（新建多边形） -->
+  <path d="M8 3 4 9l2 7 7 3 6-5-1-8-6-3z" opacity="0.7" />
+  <path d="M17 13.5v5" />
+  <path d="M14.5 16h5" />
+</svg>

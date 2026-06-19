@@ -15,10 +15,12 @@ from PyQt5.QtWidgets import (
 
 from app.ui.pages.base_page import BasePage
 from app.ui.widgets.video_canvas import VideoCanvas
+from app.ui.widgets.svg_icon import load_svg_icon
 
 
 class RoiPage(BasePage):
     title = "ROI 区域"
+    icon_name = "roi"
 
     # 用户操作 -> MainWindow
     new_roi_requested = pyqtSignal()
@@ -64,9 +66,11 @@ class RoiPage(BasePage):
         row = QHBoxLayout()
         self.btn_new = QPushButton("新建多边形")
         self.btn_new.setProperty("role", "flat")
+        self.btn_new.setIcon(load_svg_icon("polygon_add", self.palette.fg_main, 16))
         self.btn_new.clicked.connect(self._on_new_clicked)
         self.btn_clear = QPushButton("清除全部")
         self.btn_clear.setProperty("role", "flat")
+        self.btn_clear.setIcon(load_svg_icon("trash", self.palette.fg_main, 16))
         self.btn_clear.clicked.connect(self.clear_roi_requested.emit)
         row.addWidget(self.btn_new)
         row.addWidget(self.btn_clear)
@@ -75,9 +79,11 @@ class RoiPage(BasePage):
         row2 = QHBoxLayout()
         self.btn_import = QPushButton("导入")
         self.btn_import.setProperty("role", "flat")
+        self.btn_import.setIcon(load_svg_icon("import", self.palette.fg_main, 16))
         self.btn_import.clicked.connect(self.import_requested.emit)
         self.btn_export = QPushButton("导出")
         self.btn_export.setProperty("role", "flat")
+        self.btn_export.setIcon(load_svg_icon("export", self.palette.fg_main, 16))
         self.btn_export.clicked.connect(self.export_requested.emit)
         row2.addWidget(self.btn_import)
         row2.addWidget(self.btn_export)

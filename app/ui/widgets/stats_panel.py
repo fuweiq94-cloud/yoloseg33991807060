@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
 import pyqtgraph as pg
 
 from app.ui.theme import get_palette
+from app.ui.widgets.svg_icon import load_svg_pixmap
 
 
 class StatsPanel(QWidget):
@@ -274,10 +275,19 @@ class StatsPanel(QWidget):
         self._install(plot)
 
     def _show_empty(self, text: str) -> None:
+        wrap = QWidget()
+        v = QVBoxLayout(wrap)
+        v.setAlignment(Qt.AlignCenter)
+        v.setSpacing(10)
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(load_svg_pixmap("empty_chart", self._palette.fg_sub, 56))
+        icon_lbl.setAlignment(Qt.AlignCenter)
         lbl = QLabel(text)
         lbl.setAlignment(Qt.AlignCenter)
         lbl.setProperty("role", "sub")
-        self._install(lbl)
+        v.addWidget(icon_lbl)
+        v.addWidget(lbl)
+        self._install(wrap)
 
     def _install(self, widget: QWidget) -> None:
         widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
