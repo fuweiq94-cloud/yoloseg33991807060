@@ -104,7 +104,7 @@ def build_qss(p: Palette, font_size: int = 13) -> str:
     QToolBar {{
         background-color: {p.bg_panel};
         border: none;
-        border-bottom: 1px solid {p.border};
+        border-top: 1px solid {p.border};
         spacing: 4px;
         padding: 4px;
     }}
@@ -115,7 +115,26 @@ def build_qss(p: Palette, font_size: int = 13) -> str:
         border-radius: 3px;
     }}
     QToolBar QToolButton:hover {{ background-color: {p.bg_input}; }}
-    QToolBar QToolButton:checked {{ background-color: {p.primary}; }}
+    QToolBar QToolButton:checked {{ background-color: {p.primary}; color: #FFFFFF; }}
+    /* 底部快捷工具条：明确覆盖原生背景，避免 Windows 渲染成白色 */
+    QToolBar#BottomToolbar {{
+        background: {p.bg_panel};
+        border: none;
+        border-top: 1px solid {p.border};
+    }}
+    QToolBar#BottomToolbar QToolButton {{
+        background: transparent;
+        color: {p.fg_main};
+    }}
+    QToolBar#BottomToolbar QToolButton:hover {{ background-color: {p.bg_input}; }}
+    QToolBar#BottomToolbar QToolButton:checked {{
+        background-color: {p.primary};
+        color: #FFFFFF;
+    }}
+    QToolBar#BottomToolbar QSeparator {{
+        background: {p.border};
+        width: 1px; height: 16px; margin: 0 4px;
+    }}
     /* 按钮 */
     QPushButton {{
         background-color: {p.primary};

@@ -25,7 +25,8 @@ from PyQt5.QtSvg import QSvgRenderer
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel,
     QPushButton, QListWidget, QListWidgetItem, QStackedWidget,
-    QMessageBox, QFileDialog, QMenu, QAction,
+    QMessageBox, QFileDialog, QMenu, QAction, QToolBar, QFrame,
+    QSizePolicy,
 )
 from PyQt5.QtMultimedia import QSound
 
@@ -106,10 +107,12 @@ class MainWindow(QMainWindow):
         self._cur_objs = 0
         self._cur_alarm = False
 
-        self._build_menu()
+        self._build_bottom_toolbar()
+        # 隐藏系统原生菜单栏：改用底部工具条承载同样的快捷操作
+        self.menuBar().setVisible(False)
         self._build_central()
         self._build_statusbar()
-        self._apply_statusbar_state()  # 默认折叠状态栏
+        self._apply_statusbar_state()  # 默认显示状态栏
 
         # 启动后异步初始化检测器
         QTimer.singleShot(50, self._lazy_init_detector)
@@ -135,23 +138,47 @@ class MainWindow(QMainWindow):
     # ====================================================================
     # 装配
     # ====================================================================
-    def _build_menu(self) -> None:
-        menubar = self.menuBar()
-        m_nav = menubar.addMenu("页面")
-        for idx, name in enumerate(("检测", "ROI 区域", "统计与异常帧", "设置")):
+    def _build_bottom_toolbar(self) -> None:
+        """底部快捷工具条：页面跳转 + 状态栏开关 + 关于。
+
+        替代原顶部菜单栏（页面/视图/帮助）。作为 QMainWindow 的工具栏，
+        默认加在顶部；构造后通过 setToolBarArea 移到底部（Qt.BottomToolBarArea），
+        使其紧贴状态栏上方。
+        """
+        tb = QToolBar("快捷")
+        tb.setObjectName("BottomToolbar")
+        tb.setMovable(False)
+        tb.setFloatable(False)
+        tb.setIconSize(QSize(16, 16))
+        self.addToolBar(Qt.BottomToolBarArea, tb)
+
+        # 页面跳转（对应原「页面」菜单）
+        for idx, name in enumerate(("检测", "ROI 区域", "统计", "设置")):
             act = QAction(name, self)
             act.triggered.connect(lambda _checked=False, i=idx: self._goto_page(i))
-            m_nav.addAction(act)
+            tb.addAction(act)
 
-        m_view = menubar.addMenu("视图")
-        self.act_toggle_statusbar = QAction("显示状态栏", self, checkable=True)
+        tb.addSeparator()
+
+        # 视图：状态栏开关（对应原「视图」菜单）
+        self.act_toggle_statusbar = QAction("状态栏", self, checkable=True)
         self.act_toggle_statusbar.triggered.connect(self._toggle_statusbar)
-        m_view.addAction(self.act_toggle_statusbar)
+        tb.addAction(self.act_toggle_statusbar)
 
-        m_help = menubar.addMenu("帮助")
+        tb.addSeparator()
+
+        # 帮助：关于（对应原「帮助」菜单）
         act_about = QAction("关于", self)
         act_about.triggered.connect(lambda: AboutDialog(self).exec_())
-        m_help.addAction(act_about)
+        tb.addAction(act_about)
+
+        tb.addSeparator()
+        # 右侧弹簧把后面的内容推到最右（留空，保持简洁）
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tb.addWidget(spacer)
+
+        self._bottom_toolbar = tb
 
     def _build_central(self) -> None:
         central = QWidget()
@@ -755,6 +782,8 @@ class MainWindow(QMainWindow):
             self._apply_theme_to_pages()
             # 切换主题后刷新标题栏颜色
             set_titlebar_color(self, self._palette)
+            # 刷新底部工具条样式，跟随主题
+            self._repolish_toolbar()
 
         if self._detector is not None:
             self._sync_detector_params()
@@ -780,6 +809,25 @@ class MainWindow(QMainWindow):
         # 仅在首次显示时上色一次（避免每次重绘都调 DWM API）
         if not getattr(self, "_titlebar_themed", False):
             self._titlebar_themed = set_titlebar_color(self, self._palette)
+        # 首次显示时强制刷新底部工具条样式：QToolBar 在 Windows 上有时保留
+        # 原生背景（白色），需 unpolish/polish 让 QSS 重新生效。
+        if not getattr(self, "_toolbar_repolished", False):
+            self._toolbar_repolished = True
+            self._repolish_toolbar()
+
+    def _repolish_toolbar(self) -> None:
+        """强制重新应用样式到底部工具条，确保跟随主题色（非白色）。"""
+        tb = getattr(self, "_bottom_toolbar", None)
+        if tb is None:
+            return
+        from PyQt5.QtWidgets import QApplication
+        style = QApplication.instance().style()
+        for w in [tb] + tb.findChildren(type(tb.widgetForAction(tb.actions()[0])) if tb.actions() else []):
+            try:
+                style.unpolish(w)
+                style.polish(w)
+            except Exception:
+                pass
 
     # ====================================================================
     # 关闭
