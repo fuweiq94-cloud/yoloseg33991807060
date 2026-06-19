@@ -1,0 +1,27 @@
+.deep-copilot/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# 运行时生成的数据（日志 / 截图 / 统计 csv）
+data/logs/
+data/snapshots/
+data/clips/
+data/_*.png
+data/_*.jpg
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+
+# 操作系统垃圾文件
+Thumbs.db
+desktop.ini
+.DS_Store
+nul

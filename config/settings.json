@@ -1,0 +1,43 @@
+{
+  "detection": {
+    "model_path": "assets/models/yolo26s-seg.pt",
+    "device": "cpu",
+    "conf": 0.45,
+    "iou": 0.5,
+    "classes": [0],
+    "imgsz": 640,
+    "show_masks": true,
+    "show_boxes": true,
+    "show_labels": true
+  },
+  "alarm": {
+    "enabled_visual": true,
+    "enabled_sound": true,
+    "enabled_snapshot": true,
+    "enabled_log": true,
+    "sound_file": "assets/sounds/alarm.wav",
+    "cooldown_seconds": 3.0,
+    "clip_pre_seconds": 2.0,
+    "clip_post_seconds": 2.0,
+    "popup": true
+  },
+  "roi": {
+    "line_color": "#2D6CDF",
+    "fill_alpha": 60,
+    "line_width": 2
+  },
+  "appearance": {
+    "theme": "dark",
+    "font_size": 13,
+    "primary_color": "#2D6CDF"
+  },
+  "paths": {
+    "snapshots_dir": "data/snapshots",
+    "clips_dir": "data/clips",
+    "logs_dir": "data/logs"
+  },
+  "source": {
+    "last_type": "camera",
+    "last_camera_index": 0
+  }
+}

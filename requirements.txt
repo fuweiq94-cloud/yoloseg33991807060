@@ -1,0 +1,15 @@
+# 安全识别系统依赖清单
+# 在项目内 .venv 中独立安装，自包含（含 ultralytics + torch）
+
+# --- 推理 ---
+ultralytics>=8.3         # YOLO26s-seg 实例分割推理（自带 torch 依赖）
+torch>=2.2               # 超薄约束，由 ultralytics 拉取合适版本；CPU 版即可
+opencv-python>=4.8       # 视频读取与图像处理
+numpy>=1.23              # 数组运算
+
+# --- GUI ---
+PyQt5>=5.15              # GUI 框架
+pyqtgraph>=0.13          # 统计图表（柱状/折线/饼图/报警趋势）
+
+# --- 业务 ---
+shapely>=2.0             # ROI 多边形几何判定（点-多边形包含）
