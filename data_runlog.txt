@@ -1,2 +1,0 @@
-[run.py] 切换到虚拟环境解释器：C:\Users\fu\Desktop\ultralytics\security-vision-system\.venv\Scripts\python.exe
-[2026-06-20 09:59:04] [INFO] [MainThread] 检测器初始化成功: C:\Users\fu\Desktop\ultralytics\security-vision-system\assets/models/yolo26s-seg.pt
