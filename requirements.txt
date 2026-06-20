@@ -1,14 +1,18 @@
 # 安全识别系统依赖清单
 # 在项目内 .venv 中独立安装，自包含（含 ultralytics + torch）
+# 安装： python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
 
 # --- 推理 ---
-ultralytics>=8.3         # YOLO26s-seg 实例分割推理（自带 torch 依赖）
+ultralytics>=8.4         # YOLO26s-seg 实例分割推理 + track() 目标跟踪（BoT-SORT）
 torch>=2.2               # 超薄约束，由 ultralytics 拉取合适版本；CPU 版即可
 opencv-python>=4.8       # 视频读取与图像处理
 numpy>=1.23              # 数组运算
 
+# --- 跟踪 ---
+lap>=0.5                 # BoT-SORT 跟踪器的线性指派依赖（ultralytics track() 需要）
+
 # --- GUI ---
-PyQt5>=5.15              # GUI 框架
+PyQt5>=5.15              # GUI 框架（含 QtCore/QtGui/QtWidgets/QtSvg —— QtSvg 用于渲染 SVG 图标）
 pyqtgraph>=0.13          # 统计图表（柱状/折线/饼图/报警趋势）
 
 # --- 业务 ---
