@@ -34,31 +34,40 @@ logger = get_logger()
 
 
 class _CaptureThread(QThread):
-    """独立的帧采集线程：持续 read，只保留最新一帧（覆盖式）。
+    """独立的帧采集线程。
 
-    与推理线程解耦：相机/流持续推帧时，OpenCV 内部缓冲会堆积旧帧；
-    本线程高频 read 把最新帧写入单槽，旧的被覆盖。推理线程取到的永远
-    是「当下」的画面，消除「越来越滞后」的累积延迟。
+    两种策略（按源类型选择）：
+    - 视频文件（str 源）：用有界队列逐帧缓存，保证每帧都被推理消费，
+      画面连续不跳帧（视频回放场景要求顺序性）。队列满时丢弃最旧帧
+      避免无限堆积，但正常推理跟得上时不会丢。
+    - 摄像头/RTSP（int 源）：覆盖式单槽，只保留最新帧，消除累积延迟
+      （实时流场景要求低延迟，丢旧帧可接受）。
     """
+
+    # 视频文件的最大缓冲帧数（超过则丢最旧的，防止推理严重落后时无限堆积）
+    _FILE_QUEUE_MAX = 30
 
     def __init__(self, source, parent=None) -> None:
         super().__init__(parent)
         self._source = source
+        self._is_file = isinstance(source, str)
         self._stop_flag = False
         self._lock = threading.Lock()
-        self._latest: np.ndarray | None = None      # 最新帧（受锁保护）
-        self._ok = False                             # 最近一次 read 是否成功
+        # 摄像头模式用单槽
+        self._latest: np.ndarray | None = None
+        self._ok = False
+        # 视频文件模式用队列
+        from collections import deque
+        self._queue: deque = deque()
         self._cap: cv2.VideoCapture | None = None
 
     def run(self) -> None:
         # 摄像头（int 源）在 Windows 下用 DSHOW 后端降低延迟；视频文件/RTSP 用默认。
-        is_camera = not isinstance(self._source, str)
-        if is_camera:
-            cap = cv2.VideoCapture(self._source, cv2.CAP_DSHOW)
-        else:
+        if self._is_file:
             cap = cv2.VideoCapture(self._source)
+        else:
+            cap = cv2.VideoCapture(self._source, cv2.CAP_DSHOW)
         # 关键：把 OpenCV 内部缓冲压到最小，read() 拿到的就是最新帧而非积压的旧帧。
-        # 不是所有后端都支持，忽略失败即可。
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
@@ -78,18 +87,32 @@ class _CaptureThread(QThread):
                     self._latest = None
                 break
             with self._lock:
-                self._latest = frame
-                self._ok = True
+                if self._is_file:
+                    # 视频文件：入队，保证顺序性。满则丢最旧帧（防堆积）。
+                    self._queue.append(frame)
+                    if len(self._queue) > self._FILE_QUEUE_MAX:
+                        self._queue.popleft()
+                    self._ok = True
+                else:
+                    # 摄像头：覆盖式，只留最新
+                    self._latest = frame
+                    self._ok = True
 
         cap.release()
 
     def take(self) -> tuple[bool, np.ndarray | None]:
-        """取走最新帧（并清空，避免同一帧被推理两次）。返回 (ok, frame)。"""
+        """取走下一帧。视频文件按队列顺序（FIFO），摄像头取最新。返回 (ok, frame)。"""
         with self._lock:
-            frame = self._latest
-            ok = self._ok
-            self._latest = None  # 消费后清空，直到采集线程写入新帧
-        return ok, frame
+            if self._is_file:
+                if self._queue:
+                    return True, self._queue.popleft()
+                # 队列空但采集线程还在跑：返回 None，主循环会短暂等待
+                return self._ok, None
+            else:
+                frame = self._latest
+                ok = self._ok
+                self._latest = None  # 消费后清空
+                return ok, frame
 
     def stop(self) -> None:
         self._stop_flag = True
