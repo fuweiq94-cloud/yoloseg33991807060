@@ -1,8 +1,6 @@
 """单图推理工作线程：一次性读取图片、推理、ROI 判定、统计，发信号后退出。"""
 from __future__ import annotations
 
-import time
-
 import cv2
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -10,8 +8,9 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from app.core.detector import Detector
 from app.core.roi import RoiManager
 from app.core.statistics import StatsCollector
-from app.core.alarm import AlarmEngine, AlarmEvent
+from app.core.alarm import AlarmEngine
 from app.utils.logger import get_logger
+from app.workers._frame_pipeline import process_frame
 
 logger = get_logger()
 
@@ -53,35 +52,13 @@ class ImageWorker(QThread):
             self.error_occurred.emit(f"推理失败: {e}")
             return
 
-        centers = result.centers()
-        violators = self._roi.violators(centers, result.clss)
-        violator_indices = [bi for bi, _ in violators]
+        # ROI 判定 + 报警 + 统计采样（与 VideoWorker 共享同一流水线）
+        outcome = process_frame(
+            result, self._roi, self._stats, self._alarm, use_tracking=False,
+        )
+        for rid, cls_ids, confs in outcome.fired_alarms:
+            self.alarm_ready.emit(rid, cls_ids, confs)
+        self.stats_ready.emit({"counts": outcome.counts, "alarms": outcome.alarms_this_frame})
 
-        alarms_this_frame = 0
-        if violators and self._alarm is not None:
-            by_roi: dict[int, list[int]] = {}
-            for bi, rid in violators:
-                by_roi.setdefault(rid, []).append(bi)
-            for rid, idxs in by_roi.items():
-                cls_ids = [int(result.clss[bi]) for bi in idxs]
-                confs = [float(result.confs[bi]) for bi in idxs]
-                event = AlarmEvent(
-                    timestamp=time.time(),
-                    frame=result.annotated.copy(),
-                    cls_ids=cls_ids,
-                    confs=confs,
-                    roi_id=rid,
-                    box_indices=list(idxs),
-                )
-                if self._alarm.trigger(event):
-                    alarms_this_frame += 1
-                    self.alarm_ready.emit(rid, cls_ids, confs)
-
-        counts: dict[int, int] = {}
-        for cid in result.clss:
-            counts[int(cid)] = counts.get(int(cid), 0) + 1
-        self._stats.record(time.time(), counts, alarms_this_frame)
-        self.stats_ready.emit({"counts": counts, "alarms": alarms_this_frame})
-
-        self.frame_ready.emit(result.annotated, violator_indices, centers)
+        self.frame_ready.emit(result.annotated, outcome.violator_indices, outcome.centers)
         self.finished_source.emit()

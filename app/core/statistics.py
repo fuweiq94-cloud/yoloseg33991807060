@@ -135,29 +135,29 @@ class StatsCollector:
         返回 (时间标签列表, 目标数列表)。"""
         with self._lock:
             samples = list(self._samples)
-        if not samples:
-            return [], []
-        # 按时间桶聚合每帧目标总数
-        buckets: dict[int, int] = defaultdict(int)
-        for s in samples:
-            bucket = int(s.timestamp // bin_seconds)
-            buckets[bucket] += sum(s.counts.values())
-        sorted_keys = sorted(buckets.keys())
-        labels = [datetime.fromtimestamp(k * bin_seconds).strftime("%H:%M") for k in sorted_keys]
-        values = [buckets[k] for k in sorted_keys]
-        return labels, values
+        # 每帧目标总数（各类瞬时计数之和）作为桶聚合值
+        return self._bucketize(samples, lambda s: sum(s.counts.values()), bin_seconds)
 
     def alarm_trend(self, bin_seconds: int = 60) -> tuple[list[str], list[int]]:
         """报警数随时间变化，按 bin_seconds 分箱。"""
         with self._lock:
             samples = list(self._samples)
+        # 仅累计发生报警的采样；无报警的采样贡献 0，跳过以与原行为一致
+        return self._bucketize(
+            [s for s in samples if s.alarms > 0],
+            lambda s: s.alarms,
+            bin_seconds,
+        )
+
+    @staticmethod
+    def _bucketize(samples, value_of, bin_seconds: int) -> tuple[list[str], list[int]]:
+        """把采样按 bin_seconds 时间桶聚合。value_of: sample -> 该采样的贡献值。"""
         if not samples:
             return [], []
         buckets: dict[int, int] = defaultdict(int)
         for s in samples:
-            if s.alarms > 0:
-                bucket = int(s.timestamp // bin_seconds)
-                buckets[bucket] += s.alarms
+            bucket = int(s.timestamp // bin_seconds)
+            buckets[bucket] += value_of(s)
         sorted_keys = sorted(buckets.keys())
         labels = [datetime.fromtimestamp(k * bin_seconds).strftime("%H:%M") for k in sorted_keys]
         values = [buckets[k] for k in sorted_keys]

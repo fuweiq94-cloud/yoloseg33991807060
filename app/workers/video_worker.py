@@ -5,9 +5,8 @@
 """
 from __future__ import annotations
 
-import time
-import numpy as np
 import cv2
+import numpy as np
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -17,6 +16,7 @@ from app.core.statistics import StatsCollector
 from app.core.alarm import AlarmEngine
 from app.utils.fps_counter import FpsCounter
 from app.utils.logger import get_logger
+from app.workers._frame_pipeline import process_frame
 
 logger = get_logger()
 
@@ -110,54 +110,20 @@ class VideoWorker(QThread):
                 logger.exception("推理异常: %s", e)
                 continue
 
-            # ROI 判定
-            centers = result.centers()
-            violators = self._roi.violators(centers, result.clss)  # [(box_idx, roi_id), ...]
-            violator_indices = [bi for bi, _ in violators]
-
-            # 报警（若有违反且注入了 alarm 引擎）
-            alarms_this_frame = 0
-            if violators and self._alarm is not None:
-                # 按 roi 聚合
-                by_roi: dict[int, list[int]] = {}
-                for bi, rid in violators:
-                    by_roi.setdefault(rid, []).append(bi)
-                for rid, idxs in by_roi.items():
-                    cls_ids = [int(result.clss[bi]) for bi in idxs]
-                    confs = [float(result.confs[bi]) for bi in idxs]
-                    from app.core.alarm import AlarmEvent
-                    event = AlarmEvent(
-                        timestamp=time.time(),
-                        frame=result.annotated.copy(),
-                        cls_ids=cls_ids,
-                        confs=confs,
-                        roi_id=rid,
-                        box_indices=list(idxs),
-                    )
-                    fired = self._alarm.trigger(event)
-                    if fired:
-                        alarms_this_frame += 1
-                        self.alarm_ready.emit(rid, cls_ids, confs)
-
-            # 统计采样
-            counts: dict[int, int] = {}
-            for cid in result.clss:
-                counts[int(cid)] = counts.get(int(cid), 0) + 1
-            # 传入 track_ids 用于去重累计（同目标多帧只计一次）
-            tids = [int(t) for t in result.track_ids] if len(result.track_ids) else []
-            clss_list = [int(c) for c in result.clss] if len(result.clss) else []
-            self._stats.record(
-                time.time(), counts, alarms_this_frame,
-                track_ids=tids, clss=clss_list,
+            # ROI 判定 + 报警 + 统计采样（与 ImageWorker 共享同一流水线）
+            outcome = process_frame(
+                result, self._roi, self._stats, self._alarm, use_tracking=True,
             )
-            self.stats_ready.emit({"counts": counts, "alarms": alarms_this_frame})
+            for rid, cls_ids, confs in outcome.fired_alarms:
+                self.alarm_ready.emit(rid, cls_ids, confs)
+            self.stats_ready.emit({"counts": outcome.counts, "alarms": outcome.alarms_this_frame})
 
             # FPS
             self._fps.tick()
             self.fps_updated.emit(self._fps.fps())
 
             # 发帧（annotated + 违反框索引 + 中心点用于画布交互）
-            self.frame_ready.emit(result.annotated, violator_indices, centers)
+            self.frame_ready.emit(result.annotated, outcome.violator_indices, outcome.centers)
 
         cap.release()
         logger.info("VideoWorker 结束")

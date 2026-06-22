@@ -621,10 +621,10 @@ class MainWindow(QMainWindow):
     def _on_alarm_sound(self, event: AlarmEvent) -> None:
         """声音回调：在工作线程被 AlarmEngine.trigger 同步调用。
         QSound 是 QObject，不能在工作线程创建/播放（会触发跨线程
-        "Cannot create children for a parent in a different thread"）。
+        "Cannot create children for a parent that is in a different thread"）。
         改为发信号 _sound_alarm，转发到主线程执行。
         """
-        sound_file = self._alarm._config.sound_file if self._alarm else ""
+        sound_file = self._alarm.sound_file if self._alarm else ""
         if sound_file and os.path.isfile(sound_file):
             self._sound_alarm.emit(sound_file)
 

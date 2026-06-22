@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import os
-from functools import lru_cache
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon, QPixmap, QPainter
@@ -20,20 +19,28 @@ logger = get_logger()
 # 项目根目录（app/ui/widgets/svg_icon.py 上溯三级）
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+# SVG 源文本缓存：图标文件在运行期不变，读一次即可，避免每次重绘都做磁盘 IO。
+# name -> svg 文本（命中失败也缓存 None，避免对缺失图标反复 open 报警）。
+_svg_text_cache: dict[str, str | None] = {}
+
 
 def _icons_dir() -> str:
     return os.path.join(_PROJECT_ROOT, "assets", "icons")
 
 
 def _read_svg(name: str) -> str | None:
-    """读取 SVG 源文本；缺失返回 None。"""
+    """读取 SVG 源文本；缺失返回 None。结果按 name 缓存（图标文件运行期不变）。"""
+    if name in _svg_text_cache:
+        return _svg_text_cache[name]
     path = os.path.join(_icons_dir(), f"{name}.svg")
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return f.read()
+            text = f.read()
     except OSError:
         logger.warning("SVG 图标缺失: %s", path)
-        return None
+        text = None
+    _svg_text_cache[name] = text
+    return text
 
 
 def _render_pixmap(svg_text: str, color: str, size: int) -> QPixmap:

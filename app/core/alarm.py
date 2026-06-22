@@ -82,6 +82,12 @@ class AlarmEngine:
         with self._lock:
             self._config = config
 
+    @property
+    def sound_file(self) -> str:
+        """当前配置的声音文件路径（供 UI 在主线程播放）。"""
+        with self._lock:
+            return self._config.sound_file
+
     # ---- 回调注入 ----
     def set_visual_callback(self, cb: VisualCallback) -> None:
         self._on_visual = cb
