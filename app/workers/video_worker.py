@@ -4,9 +4,10 @@
 不在此线程画 ROI 叠加（交由 VideoCanvas 用 QPainter 画，更灵活且支持交互）。
 
 性能要点：
-- 采集与推理解耦：_CaptureThread 独立读取相机/视频帧，只保留「最新一帧」
-  （覆盖式单槽）。VideoWorker 主循环从最新帧消费，旧帧自动丢弃。
-  这样即使某帧推理慢，下一帧也是相机当前画面，不会累积滞后。
+- 采集与推理解耦：_CaptureThread 独立读取相机/视频帧，VideoWorker 主循环消费。
+- 视频文件用「有界队列 + 背压」：队列满则采集阻塞，绝不丢帧，保证每帧都被
+  推理 + 录制 → 回放时长与原片一致，画面严格顺序前进不跳帧。
+- 摄像头用「覆盖式单槽」：只保留最新帧，消除累积延迟，旧帧丢弃可接受。
 - 打开后立即设 CAP_PROP_BUFFERSIZE=1，避免 OpenCV 内部缓冲堆积旧帧。
 - Windows 下摄像头用 DSHOW 后端，降低打开延迟。
 - frame_ready 发射前对 annotated 做 .copy()，避免与 ultralytics 内部
@@ -37,14 +38,20 @@ class _CaptureThread(QThread):
     """独立的帧采集线程。
 
     两种策略（按源类型选择）：
-    - 视频文件（str 源）：用有界队列逐帧缓存，保证每帧都被推理消费，
-      画面连续不跳帧（视频回放场景要求顺序性）。队列满时丢弃最旧帧
-      避免无限堆积，但正常推理跟得上时不会丢。
+    - 视频文件（str 源）：有界队列 + **背压**。队列满时生产者阻塞等待消费者
+      取走，绝不丢帧——这是视频「完整识别」的关键（18s 视频的每一帧都会被
+      推理 + 录制，回放时长与原片一致）。消费者按 FIFO 取，画面严格顺序前进，
+      不会跳帧/停顿。
     - 摄像头/RTSP（int 源）：覆盖式单槽，只保留最新帧，消除累积延迟
       （实时流场景要求低延迟，丢旧帧可接受）。
+
+    注：cv2.VideoCapture.read() 对本地文件是「尽快读」（不受源帧率约束），
+    若用「满则丢最旧」策略，推理只要稍慢于磁盘读取，绝大多数帧就会被丢弃，
+    导致 N 秒视频只录到 1~2 秒。背压（满则阻塞）从根上杜绝此问题。
     """
 
-    # 视频文件的最大缓冲帧数（超过则丢最旧的，防止推理严重落后时无限堆积）
+    # 视频文件的有界缓冲帧数（背压语义：满则生产者阻塞，而非丢帧）。
+    # 30 帧 × ~1MB ≈ 30MB，足够吸收推理与读取间的短时抖动。
     _FILE_QUEUE_MAX = 30
 
     def __init__(self, source, parent=None) -> None:
@@ -52,14 +59,16 @@ class _CaptureThread(QThread):
         self._source = source
         self._is_file = isinstance(source, str)
         self._stop_flag = False
-        self._lock = threading.Lock()
+        # Condition 自带锁：生产者/消费者用同一把锁协调「满则等 / 取走则唤醒」。
+        self._cond = threading.Condition()
         # 摄像头模式用单槽
         self._latest: np.ndarray | None = None
         self._ok = False
-        # 视频文件模式用队列
+        # 视频文件模式用有界队列
         from collections import deque
         self._queue: deque = deque()
         self._cap: cv2.VideoCapture | None = None
+        self._source_fps: float = 0.0
 
     def run(self) -> None:
         # 摄像头（int 源）在 Windows 下用 DSHOW 后端降低延迟；视频文件/RTSP 用默认。
@@ -74,24 +83,33 @@ class _CaptureThread(QThread):
             pass
 
         if not cap.isOpened():
-            self._ok = False
+            with self._cond:
+                self._ok = False
             return
         self._cap = cap
+        # 读源帧率，供 VideoWorker 写录制文件时对齐时长（18s@30fps → 录制也 18s）。
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            self._source_fps = float(fps) if fps and fps > 0 else 0.0
+        except Exception:
+            self._source_fps = 0.0
 
         while not self._stop_flag:
             ok, frame = cap.read()
             if not ok:
                 # 视频文件读到末尾或流断开
-                with self._lock:
+                with self._cond:
                     self._ok = False
                     self._latest = None
                 break
-            with self._lock:
+            with self._cond:
                 if self._is_file:
-                    # 视频文件：入队，保证顺序性。满则丢最旧帧（防堆积）。
+                    # 背压：队列满则等待消费者取走，绝不丢帧。
+                    while len(self._queue) >= self._FILE_QUEUE_MAX and not self._stop_flag:
+                        self._cond.wait(timeout=0.1)
+                    if self._stop_flag:
+                        break
                     self._queue.append(frame)
-                    if len(self._queue) > self._FILE_QUEUE_MAX:
-                        self._queue.popleft()
                     self._ok = True
                 else:
                     # 摄像头：覆盖式，只留最新
@@ -102,10 +120,12 @@ class _CaptureThread(QThread):
 
     def take(self) -> tuple[bool, np.ndarray | None]:
         """取走下一帧。视频文件按队列顺序（FIFO），摄像头取最新。返回 (ok, frame)。"""
-        with self._lock:
+        with self._cond:
             if self._is_file:
                 if self._queue:
-                    return True, self._queue.popleft()
+                    frame = self._queue.popleft()
+                    self._cond.notify()  # 唤醒可能因「队列满」而阻塞的生产者
+                    return True, frame
                 # 队列空但采集线程还在跑：返回 None，主循环会短暂等待
                 return self._ok, None
             else:
@@ -115,12 +135,19 @@ class _CaptureThread(QThread):
                 return ok, frame
 
     def stop(self) -> None:
-        self._stop_flag = True
+        with self._cond:
+            self._stop_flag = True
+            self._cond.notify_all()  # 唤醒因背压阻塞的生产者，使其能及时退出
 
     @property
     def is_open(self) -> bool:
         """源是否成功打开（打开尝试过后才准确）。"""
         return self._cap is not None and self._cap.isOpened()
+
+    @property
+    def source_fps(self) -> float:
+        """源视频的帧率（文件打开后才有效）；摄像头为 0.0。"""
+        return self._source_fps
 
 
 class VideoWorker(QThread):
@@ -261,11 +288,15 @@ class VideoWorker(QThread):
             if self._record_path is not None:
                 if self._writer is None:
                     h, w = annotated_for_emit.shape[:2]
+                    # 用源帧率写录制文件，使「写入帧数 / 帧率」≈ 原片时长
+                    # （背压保证每帧都被写入，故时长对齐）。
+                    src_fps = self._capture.source_fps
+                    rec_fps = src_fps if src_fps > 0 else self._record_fps
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    self._writer = cv2.VideoWriter(self._record_path, fourcc, self._record_fps, (w, h))
+                    self._writer = cv2.VideoWriter(self._record_path, fourcc, rec_fps, (w, h))
                     if self._writer.isOpened():
                         self._record_start_ts = time.time()
-                        logger.info("开始录制到: %s (%dx%d@%.0ffps)", self._record_path, w, h, self._record_fps)
+                        logger.info("开始录制到: %s (%dx%d@%.1ffps)", self._record_path, w, h, rec_fps)
                     else:
                         logger.warning("VideoWriter 打开失败，录制取消: %s", self._record_path)
                         self._writer = None
