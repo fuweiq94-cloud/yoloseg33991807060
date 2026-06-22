@@ -131,10 +131,10 @@ class MainWindow(QMainWindow):
         self._cur_source_name: str = ""
         self._cur_source_type: object = None
 
-        # 插件系统：加载顺序在 _build_central 之后（那时 nav/stack 已就绪）
+        # 插件系统：在 __init__ 末尾加载（nav/stack/lbl_status 全部就绪后）
         self._plugin_mgr: PluginManager | None = None
-        # 插件页在 stack 中的索引范围（[start, end)，用于事件分发时判断当前页是否插件页）
-        self._plugin_pages: list = []   # list of _LoadedPlugin
+        # 已加载的插件列表（_LoadedPlugin），用于事件分发
+        self._plugin_pages: list = []
 
         self._build_bottom_toolbar()
         # 隐藏系统原生菜单栏：改用底部工具条承载同样的快捷操作
@@ -142,6 +142,10 @@ class MainWindow(QMainWindow):
         self._build_central()
         self._build_statusbar()
         self._apply_statusbar_state()  # 默认显示状态栏
+
+        # 加载插件：必须在 _build_central（nav/stack 就绪）+ _build_statusbar
+        # （lbl_status 就绪，PluginContext 依赖它）之后。
+        self._load_plugins()
 
         # 启动后异步初始化检测器
         QTimer.singleShot(50, self._lazy_init_detector)
@@ -322,8 +326,8 @@ class MainWindow(QMainWindow):
         self._wire_pages()
         # 应用主题到各页面
         self._apply_theme_to_pages()
-        # 加载插件（在页面栈/导航就绪 + 主题应用之后）
-        self._load_plugins()
+        # 注意：插件加载延后到 __init__ 末尾（_build_statusbar 之后），
+        # 因为 PluginContext 需要 lbl_status，而它在 _build_statusbar 里创建。
 
     def _wire_pages(self) -> None:
         # 检测页：类别筛选变化
