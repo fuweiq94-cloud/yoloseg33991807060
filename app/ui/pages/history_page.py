@@ -1,6 +1,7 @@
-"""历史记录页：以缩略图网格展示图片/视频识别历史，点击查看或播放。
+"""历史记录页：用 Tab 区分图片/视频，缩略图网格展示，点击查看或播放。
 
 数据由 HistoryManager 提供（MainWindow 注入）。本页只负责展示与交互：
+- 顶部 Tab：「图片」/「视频」分开查看，不混在一起
 - 双击/回车：图片放大查看 / 视频播放
 - 右键菜单：删除单条
 - 顶部按钮：刷新 / 清空全部
@@ -11,10 +12,11 @@ import os
 from typing import TYPE_CHECKING
 
 from PyQt5.QtCore import Qt, QSize
-from PyQt5.QtGui import QIcon, QPixmap, QImage
+from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QWidget, QMenu, QAction, QAbstractItemView, QMessageBox,
+    QTabWidget,
 )
 
 from app.ui.pages.base_page import BasePage
@@ -30,16 +32,82 @@ logger = get_logger()
 THUMB_W, THUMB_H = 200, 130  # 网格缩略图尺寸（含文字区）
 
 
+class _HistoryGrid(QListWidget):
+    """单个类型的缩略图网格（图片或视频）。"""
+
+    def __init__(self, history: "HistoryManager", page: "HistoryPage", parent=None) -> None:
+        super().__init__(parent)
+        self._history = history
+        self._page = page
+        self.setViewMode(QListWidget.IconMode)
+        self.setIconSize(QSize(THUMB_W, THUMB_H))
+        self.setResizeMode(QListWidget.Adjust)
+        self.setMovement(QListWidget.Static)
+        self.setSpacing(8)
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setUniformItemSizes(True)
+        self.itemDoubleClicked.connect(self._on_activated)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu)
+
+    def load(self, records: "list[HistoryRecord]") -> None:
+        self.clear()
+        for rec in records:
+            item = QListWidgetItem()
+            item.setText(f"{rec.label()}\n{rec.time_str()}\n{rec.sublabel()}")
+            item.setTextAlignment(Qt.AlignCenter)
+            pm = self._page.load_thumb(rec)
+            if pm is not None:
+                item.setIcon(QIcon(pm))
+            if rec.type == "video":
+                item.setToolTip(f"视频 · {rec.duration:.1f}s\n{rec.time_str()}")
+            else:
+                item.setToolTip(f"图片\n{rec.time_str()}")
+            item.setData(Qt.UserRole, rec.id)
+            self.addItem(item)
+
+    def _on_activated(self, item: QListWidgetItem) -> None:
+        record_id = item.data(Qt.UserRole)
+        record = self._history.get(record_id)
+        if record is None:
+            return
+        self._page.open_record(record)
+
+    def _on_context_menu(self, pos) -> None:
+        item = self.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        act_open = QAction("打开", self)
+        act_del = QAction("删除", self)
+        menu.addAction(act_open)
+        menu.addAction(act_del)
+        action = menu.exec_(self.mapToGlobal(pos))
+        if action is act_open:
+            self._on_activated(item)
+        elif action is act_del:
+            record_id = item.data(Qt.UserRole)
+            reply = QMessageBox.question(
+                self, "删除", "确定删除这条历史记录？文件也会被删除。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                self._history.delete(record_id)
+                self._page.refresh()
+
+
 class HistoryPage(BasePage):
-    """历史记录页。"""
+    """历史记录页：图片/视频分 Tab 展示。"""
 
     title = "历史记录"
     icon_name = "history"
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        # history_manager 由 MainWindow 调用 set_history_manager 注入
         self._history: "HistoryManager | None" = None
-        self._list: QListWidget | None = None
+        self._grid_image: _HistoryGrid | None = None
+        self._grid_video: _HistoryGrid | None = None
+        self._tabs: QTabWidget | None = None
+        self._count_label: QLabel | None = None
         self._empty_hint: QLabel | None = None
         super().__init__(parent)
 
@@ -75,23 +143,23 @@ class HistoryPage(BasePage):
         self._empty_hint.setAlignment(Qt.AlignCenter)
         self._empty_hint.setProperty("role", "sub")
         self._empty_hint.setStyleSheet(f"color: {self._palette.fg_sub}; padding: 60px;")
-        layout.addWidget(self._empty_hint)
 
-        # 缩略图网格
-        self._list = QListWidget()
-        self._list.setViewMode(QListWidget.IconMode)
-        self._list.setIconSize(QSize(THUMB_W, THUMB_H))
-        self._list.setResizeMode(QListWidget.Adjust)
-        self._list.setMovement(QListWidget.Static)
-        self._list.setSpacing(8)
-        self._list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._list.setUniformItemSizes(True)
-        self._list.itemDoubleClicked.connect(self._on_item_activated)
-        self._list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self._list.customContextMenuRequested.connect(self._on_context_menu)
-        layout.addWidget(self._list, 1)
+        # Tab：图片 / 视频分开
+        self._tabs = QTabWidget()
+        # 占位 grid（set_history_manager 后才有数据；构造时先用临时 history 占位避免报错）
+        layout.addWidget(self._empty_hint)
+        layout.addWidget(self._tabs, 1)
 
         self._root_layout.addLayout(layout, 1)
+
+    def _ensure_grids(self) -> None:
+        """懒构建两个 grid（需要 history_manager 已注入）。首次 refresh 时调用。"""
+        if self._grid_image is not None or self._history is None:
+            return
+        self._grid_image = _HistoryGrid(self._history, self, parent=self._tabs)
+        self._grid_video = _HistoryGrid(self._history, self, parent=self._tabs)
+        self._tabs.addTab(self._grid_image, "图片")
+        self._tabs.addTab(self._grid_video, "视频")
 
     def _apply_palette(self) -> None:
         if self._count_label is not None:
@@ -101,35 +169,32 @@ class HistoryPage(BasePage):
 
     # ---- 数据刷新 ----
     def refresh(self) -> None:
-        """从 HistoryManager 重新加载并展示所有记录。"""
-        if self._history is None or self._list is None:
+        """从 HistoryManager 重新加载，按类型分 Tab 展示。"""
+        if self._history is None or self._tabs is None:
             return
-        self._list.clear()
+        self._ensure_grids()
         records = self._history.all_records()
-        self._count_label.setText(f"{len(records)} 条记录")
-        self._empty_hint.setVisible(len(records) == 0)
-        self._list.setVisible(len(records) > 0)
-        for rec in records:
-            item = QListWidgetItem()
-            # 标题：来源名 + 换行 + 时间 + 统计
-            item.setText(f"{rec.label()}\n{rec.time_str()}\n{rec.sublabel()}")
-            item.setTextAlignment(Qt.AlignCenter)
-            # 缩略图
-            pm = self._load_thumb(rec)
-            if pm is not None:
-                item.setIcon(QIcon(pm))
-            # 类型角标：视频加播放标记
-            if rec.type == "video":
-                font = item.font()
-                item.setToolTip(f"视频 · {rec.duration:.1f}s\n{rec.time_str()}")
-            else:
-                item.setToolTip(f"图片\n{rec.time_str()}")
-            item.setData(Qt.UserRole, rec.id)
-            item.setData(Qt.UserRole + 1, rec.type)
-            self._list.addItem(item)
+        images = [r for r in records if r.type == "image"]
+        videos = [r for r in records if r.type == "video"]
+        # 计数标签
+        self._count_label.setText(
+            f"共 {len(records)} 条 · 图片 {len(images)} · 视频 {len(videos)}"
+        )
+        # 空状态：完全无记录时显示提示，隐藏 Tab
+        has_any = len(records) > 0
+        self._empty_hint.setVisible(not has_any)
+        self._tabs.setVisible(has_any)
+        # 分类型填充
+        self._grid_image.load(images)
+        self._grid_video.load(videos)
+        # Tab 标题带数量
+        self._tabs.setTabText(0, f"图片 ({len(images)})")
+        self._tabs.setTabText(1, f"视频 ({len(videos)})")
 
-    def _load_thumb(self, record: "HistoryRecord") -> QPixmap | None:
-        """加载缩略图为 QPixmap（带视频/图片角标叠加）。失败返回 None。"""
+    def load_thumb(self, record: "HistoryRecord") -> QPixmap | None:
+        """加载缩略图为 QPixmap。供 _HistoryGrid 调用。"""
+        if self._history is None:
+            return None
         path = self._history.thumb_path(record)
         if not os.path.isfile(path):
             return None
@@ -137,18 +202,13 @@ class HistoryPage(BasePage):
             pm = QPixmap(path)
             if pm.isNull():
                 return None
-            # 缩放到图标尺寸
             return pm.scaled(THUMB_W, THUMB_H - 30, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         except Exception:
             return None
 
-    # ---- 交互 ----
-    def _on_item_activated(self, item: QListWidgetItem) -> None:
-        record_id = item.data(Qt.UserRole)
+    # ---- 打开记录（图片放大 / 视频播放）----
+    def open_record(self, record: "HistoryRecord") -> None:
         if self._history is None:
-            return
-        record = self._history.get(record_id)
-        if record is None:
             return
         file_path = self._history.file_path(record)
         if record.type == "video":
@@ -168,7 +228,6 @@ class HistoryPage(BasePage):
         if not os.path.isfile(path):
             QMessageBox.warning(self, "文件缺失", f"图片文件不存在：\n{path}")
             return
-        # 复用 anomaly_list 的放大对话框模式：简单 QDialog + QLabel
         from PyQt5.QtWidgets import QDialog
         dlg = QDialog(self)
         dlg.setWindowTitle(f"查看 - {title}")
@@ -185,28 +244,6 @@ class HistoryPage(BasePage):
         btn.clicked.connect(dlg.accept)
         v.addWidget(btn)
         dlg.exec_()
-
-    def _on_context_menu(self, pos) -> None:
-        item = self._list.itemAt(pos)
-        if item is None or self._history is None:
-            return
-        menu = QMenu(self)
-        act_open = QAction("打开", self)
-        act_del = QAction("删除", self)
-        menu.addAction(act_open)
-        menu.addAction(act_del)
-        action = menu.exec_(self._list.mapToGlobal(pos))
-        if action is act_open:
-            self._on_item_activated(item)
-        elif action is act_del:
-            record_id = item.data(Qt.UserRole)
-            reply = QMessageBox.question(
-                self, "删除", "确定删除这条历史记录？文件也会被删除。",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if reply == QMessageBox.Yes:
-                self._history.delete(record_id)
-                self.refresh()
 
     def _on_clear_all(self) -> None:
         if self._history is None:
