@@ -259,6 +259,7 @@ class MainWindow(QMainWindow):
         self.nav = QListWidget()
         self.nav.setObjectName("NavList")
         icon_px = self.nav.fontMetrics().height() + 8
+        self._nav_icon_px = icon_px   # 供 _plugin_nav_icon 渲染时对齐尺寸
         self.nav.setIconSize(QSize(icon_px, icon_px))
         self.nav.setSpacing(2)
         self.nav.setStyleSheet(
@@ -425,8 +426,11 @@ class MainWindow(QMainWindow):
         logger.info("插件已注册到导航: %s", plugin.title)
 
     def _plugin_nav_icon(self, plugin, selected: bool) -> QIcon:
-        """加载插件导航图标。优先级：plugin.icon 指向的 svg 文件（绝对路径或
-        assets/icons 下的名字）；都没有则返回空 QIcon（显示文字）。"""
+        """加载插件导航图标。优先级：
+        1. 绝对路径的 svg 文件
+        2. 相对插件目录的 svg 文件（plugin.icon 文件名，如 "icon.svg"）
+        3. assets/icons 下的内置图标名（如 "settings"）
+        都没有则返回空 QIcon（显示文字）。"""
         from PyQt5.QtGui import QIcon
         from app.ui.widgets.svg_icon import _read_svg, _render_pixmap
         color = "#FFFFFF" if selected else self._palette.fg_sub
@@ -434,19 +438,18 @@ class MainWindow(QMainWindow):
         icon = (plugin.icon or "").strip()
         if not icon:
             return QIcon()
-        # 如果是绝对路径或插件目录下的文件，直接读文件内容
-        path = icon
-        if not os.path.isabs(path):
-            # 可能是 assets/icons 下的名字（不带扩展名）
+        # 1. 绝对路径
+        if os.path.isabs(icon) and os.path.isfile(icon):
+            path = icon
+        # 2. 相对插件目录的文件（plugin.icon 是文件名，如 "icon.svg"）
+        elif os.path.isfile(os.path.join(plugin.ctx.plugin_dir, icon)):
+            path = os.path.join(plugin.ctx.plugin_dir, icon)
+        # 3. assets/icons 下的内置图标名
+        else:
             builtin = _read_svg(icon)
             if builtin is not None:
                 return QIcon(_render_pixmap(builtin, color, size))
-            # 也可能是相对插件目录的路径
-            cand = os.path.join(self._project_root, icon)
-            if os.path.isfile(cand):
-                path = cand
-            else:
-                return QIcon()
+            return QIcon()
         try:
             with open(path, "r", encoding="utf-8") as f:
                 svg_text = f.read()
