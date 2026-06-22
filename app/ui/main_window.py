@@ -41,6 +41,7 @@ from app.ui.widgets.anomaly_list import AnomalyItem
 from app.ui.pages.detection_page import DetectionPage
 from app.ui.pages.roi_page import RoiPage
 from app.ui.pages.stats_page import StatsPage
+from app.ui.pages.history_page import HistoryPage
 from app.ui.pages.settings_page import SettingsPage
 from app.ui.dialogs.about_dialog import AboutDialog
 from app.ui.widgets.class_filter import load_classes
@@ -118,6 +119,17 @@ class MainWindow(QMainWindow):
         # 最近一帧缓存：ROI 页按需显示时补帧用（避免给隐藏画布每帧做昂贵转换）
         self._last_frame: tuple | None = None  # (annotated, violator_indices, centers)
 
+        # 历史记录管理
+        from app.core.history import HistoryManager
+        hist_dir = self._abs_path(self._cfg.get("paths.history_dir", "data/history"))
+        self._history = HistoryManager(history_dir=hist_dir)
+        self._history.cleanup_temp()  # 启动时清理上次残留的临时录制文件
+        # 当前视频录制状态：识别视频文件时，临时路径就绪后供「保存」归档
+        self._cur_record: tuple | None = None  # (tmp_path, duration, source_name)
+        # 当前源类型/名称（供保存时记录来源）
+        self._cur_source_name: str = ""
+        self._cur_source_type: object = None
+
         self._build_bottom_toolbar()
         # 隐藏系统原生菜单栏：改用底部工具条承载同样的快捷操作
         self.menuBar().setVisible(False)
@@ -164,7 +176,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(Qt.BottomToolBarArea, tb)
 
         # 页面跳转（对应原「页面」菜单）
-        for idx, name in enumerate(("检测", "ROI 区域", "统计", "设置")):
+        for idx, name in enumerate(("检测", "ROI 区域", "统计", "历史记录", "设置")):
             act = QAction(name, self)
             act.triggered.connect(lambda _checked=False, i=idx: self._goto_page(i))
             tb.addAction(act)
@@ -203,6 +215,7 @@ class MainWindow(QMainWindow):
         self.control_bar.pause_requested.connect(self._on_pause)
         self.control_bar.resume_requested.connect(self._on_resume)
         self.control_bar.stop_requested.connect(self._on_stop)
+        self.control_bar.save_requested.connect(self._on_save)
         self.control_bar.source_type_changed.connect(self._on_source_type_changed)
         toolbar_wrap = QWidget()
         th = QHBoxLayout(toolbar_wrap)
@@ -262,6 +275,7 @@ class MainWindow(QMainWindow):
         )
         self.page_roi = RoiPage()
         self.page_stats = StatsPage()
+        self.page_history = HistoryPage()
         self.page_settings = SettingsPage(self._cfg)
 
         # 页面 -> (图标文件名)
@@ -269,9 +283,10 @@ class MainWindow(QMainWindow):
             self.page_detection: "detection",
             self.page_roi: "roi",
             self.page_stats: "stats",
+            self.page_history: "history",
             self.page_settings: "settings",
         }
-        for page in (self.page_detection, self.page_roi, self.page_stats, self.page_settings):
+        for page in (self.page_detection, self.page_roi, self.page_stats, self.page_history, self.page_settings):
             self.stack.addWidget(page)
             # 折叠态清空文字（仅留图标），展开态显示标题
             item = QListWidgetItem("" if self._nav_collapsed else page.title)
@@ -312,11 +327,14 @@ class MainWindow(QMainWindow):
         self.page_roi.import_requested.connect(self._import_roi)
         self.page_roi.export_requested.connect(self._export_roi)
 
+        # 历史页：注入数据源
+        self.page_history.set_history_manager(self._history)
+
         # 设置页：应用
         self.page_settings.settings_applied.connect(self._on_settings_applied)
 
     def _apply_theme_to_pages(self) -> None:
-        for page in (self.page_detection, self.page_roi, self.page_stats, self.page_settings):
+        for page in (self.page_detection, self.page_roi, self.page_stats, self.page_history, self.page_settings):
             page.set_palette(self._palette)
         self._refresh_nav_icons()
 
@@ -532,6 +550,17 @@ class MainWindow(QMainWindow):
         self._sync_detector_params()
         self._build_alarm_engine()
         self._stop_worker()
+        # 重置保存状态：新一次识别开始，清除上次的录制结果
+        self._cur_record = None
+        self.control_bar.set_save_enabled(False)
+        # 记录当前源信息（供保存时写历史元数据）
+        self._cur_source_type = src_type
+        if src_type == SourceType.IMAGE:
+            self._cur_source_name = os.path.basename(str(source))
+        elif src_type == SourceType.VIDEO:
+            self._cur_source_name = os.path.basename(str(source))
+        else:
+            self._cur_source_name = f"摄像头{source}"
         try:
             if src_type == SourceType.IMAGE:
                 from app.workers.image_worker import ImageWorker
@@ -541,9 +570,13 @@ class MainWindow(QMainWindow):
                 )
             else:
                 from app.workers.video_worker import VideoWorker
+                # 视频文件源：自动录制到临时文件，识别完即可保存回放
+                record_path = None
+                if src_type == SourceType.VIDEO:
+                    record_path = self._history.new_temp_video_path()
                 self._worker = VideoWorker(
                     source, self._detector, self._roi_manager,
-                    self._stats, self._alarm, parent=self,
+                    self._stats, self._alarm, record_path=record_path, parent=self,
                 )
         except Exception as e:
             logger.exception("worker 创建失败")
@@ -565,6 +598,8 @@ class MainWindow(QMainWindow):
         worker.finished_source.connect(self._on_finished)
         if hasattr(worker, "fps_updated"):
             worker.fps_updated.connect(self._on_fps)
+        if hasattr(worker, "video_recorded"):
+            worker.video_recorded.connect(self._on_video_recorded)
 
     def _sync_detector_params(self) -> None:
         if self._detector is None:
@@ -678,6 +713,65 @@ class MainWindow(QMainWindow):
         self.control_bar.on_stopped()
         self._cur_alarm = False
         self.page_detection.update_status(self._cur_fps, self._cur_objs, False)
+        # 识别完成：若有可保存结果（图片帧 / 摄像头帧 / 视频录制），启用保存按钮
+        if self._last_frame is not None:
+            self.control_bar.set_save_enabled(True)
+
+    def _on_video_recorded(self, tmp_path: str, duration: float) -> None:
+        """VideoWorker 录制完成（视频文件源自然播完）。保存待归档。"""
+        self._cur_record = (tmp_path, duration, self._cur_source_name)
+        self.control_bar.set_save_enabled(True)
+        logger.info("视频录制就绪，可保存: %.1fs", duration)
+
+    def _on_save(self) -> None:
+        """保存当前识别结果到历史记录。"""
+        if self._cur_source_type == SourceType.VIDEO and self._cur_record is not None:
+            # 视频文件源：归档录制的临时视频
+            tmp_path, duration, source_name = self._cur_record
+            counts, class_names = self._collect_class_stats()
+            record = self._history.add_video(
+                tmp_path, source_name,
+                counts=counts, class_names=class_names,
+                alarms=self._stats.alarm_total, duration=duration,
+            )
+            if record is not None:
+                self._cur_record = None  # 已归档，避免重复保存
+                self.control_bar.set_save_enabled(False)
+                self.lbl_status.setText("已保存到历史记录")
+                self.page_history.refresh()
+                QMessageBox.information(self, "已保存", f"视频已保存到历史记录\n时长 {duration:.1f}s")
+            else:
+                QMessageBox.warning(self, "保存失败", "视频录制文件无效，无法保存。")
+        elif self._last_frame is not None:
+            # 图片 / 摄像头：保存当前帧
+            annotated, _violators, _centers = self._last_frame
+            counts, class_names = self._collect_class_stats()
+            self._history.add_image(
+                annotated, self._cur_source_name or "未命名",
+                counts=counts, class_names=class_names,
+                alarms=self._stats.alarm_total,
+            )
+            self.lbl_status.setText("已保存到历史记录")
+            self.page_history.refresh()
+            # 图片保存后保留按钮（可重复保存不同帧？这里禁用，避免误存同一帧）
+            self.control_bar.set_save_enabled(False)
+            QMessageBox.information(self, "已保存", "当前画面已保存到历史记录")
+        else:
+            QMessageBox.information(self, "无可保存", "请先进行一次识别。")
+
+    def _collect_class_stats(self) -> tuple[dict[int, int], dict[int, str]]:
+        """收集当前累计的各类计数与类名（供历史元数据）。"""
+        try:
+            counts_raw = self._stats.class_counts()  # {类名: 数}
+            names = self._detector.names if self._detector else {}
+            # 反查 cls_id
+            counts: dict[int, int] = {}
+            for cid, cname in names.items():
+                if cname in counts_raw:
+                    counts[int(cid)] = counts_raw[cname]
+            return counts, {int(k): v for k, v in names.items()}
+        except Exception:
+            return {}, {}
 
     # ====================================================================
     # 报警四通道

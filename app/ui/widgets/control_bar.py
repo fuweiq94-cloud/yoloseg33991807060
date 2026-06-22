@@ -25,6 +25,7 @@ class ControlBar(QWidget):
     pause_requested = pyqtSignal()
     resume_requested = pyqtSignal()
     stop_requested = pyqtSignal()
+    save_requested = pyqtSignal()          # 保存当前识别结果到历史
     source_type_changed = pyqtSignal(object)  # SourceType
 
     def __init__(self, parent=None) -> None:
@@ -78,19 +79,24 @@ class ControlBar(QWidget):
         self.btn_start = QPushButton("开始")
         self.btn_pause = QPushButton("暂停")
         self.btn_stop = QPushButton("停止")
-        for b in (self.btn_start, self.btn_pause, self.btn_stop):
+        self.btn_save = QPushButton("保存")
+        for b in (self.btn_start, self.btn_pause, self.btn_stop, self.btn_save):
             b.setIconSize(QSize(16, 16))
         self.btn_start.setIcon(load_svg_icon("start", "#FFFFFF", 16))
         self.btn_pause.setIcon(load_svg_icon("pause", "#FFFFFF", 16))
         self.btn_stop.setIcon(load_svg_icon("stop", "#FFFFFF", 16))
+        self.btn_save.setIcon(load_svg_icon("save", "#FFFFFF", 16))
         self.btn_pause.setEnabled(False)
         self.btn_stop.setEnabled(False)
+        self.btn_save.setEnabled(False)   # 有可保存的结果时才启用
         self.btn_start.clicked.connect(self._on_start)
         self.btn_pause.clicked.connect(self._on_pause)
         self.btn_stop.clicked.connect(self.stop_requested.emit)
+        self.btn_save.clicked.connect(self.save_requested.emit)
         layout.addWidget(self.btn_start)
         layout.addWidget(self.btn_pause)
         layout.addWidget(self.btn_stop)
+        layout.addWidget(self.btn_save)
 
     def _sep_label(self, text: str) -> QLabel:
         lbl = QLabel(text)
@@ -156,11 +162,16 @@ class ControlBar(QWidget):
             self.resume_requested.emit()
 
     def on_stopped(self) -> None:
-        """外部停止后重置按钮状态。"""
+        """外部停止后重置按钮状态。保存按钮不在此重置——由 MainWindow 根据
+        是否有可保存结果单独控制（视频识别完成后仍可保存录制结果）。"""
         self.btn_start.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("暂停")
         self.btn_stop.setEnabled(False)
+
+    def set_save_enabled(self, enabled: bool) -> None:
+        """启用/禁用保存按钮（有可保存的识别结果时由 MainWindow 调用）。"""
+        self.btn_save.setEnabled(enabled)
 
     @property
     def current_source(self):

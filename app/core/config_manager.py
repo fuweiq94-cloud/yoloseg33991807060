@@ -48,6 +48,7 @@ DEFAULT_CONFIG: dict = {
         "snapshots_dir": "data/snapshots",
         "clips_dir": "data/clips",
         "logs_dir": "data/logs",
+        "history_dir": "data/history",
     },
     "source": {
         "last_type": "camera",

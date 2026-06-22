@@ -13,6 +13,7 @@ __pycache__/
 data/logs/
 data/snapshots/
 data/clips/
+data/history/
 data/_*.png
 data/_*.jpg
 data/_*.txt
