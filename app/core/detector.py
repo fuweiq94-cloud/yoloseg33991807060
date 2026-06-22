@@ -13,6 +13,10 @@ import numpy as np
 # ultralytics 在复用的 venv 中
 from ultralytics import YOLO
 
+from app.utils.logger import get_logger
+
+logger = get_logger()
+
 
 @dataclass
 class DetectionResult:
@@ -56,6 +60,7 @@ class Detector:
         iou: float = 0.5,
         classes: list[int] | None = None,
         imgsz: int = 640,
+        half: bool | None = None,
     ) -> None:
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"模型文件不存在: {model_path}")
@@ -65,11 +70,23 @@ class Detector:
         self._iou = float(iou)
         self._classes = list(classes) if classes else None
         self._imgsz = int(imgsz)
+        # FP16 半精度：仅在 CUDA 设备上启用（CPU 上 half 无加速甚至报错）。
+        # 默认 None → CUDA 自动开、CPU 强制关。可被显式参数覆盖。
+        self._half = self._resolve_half(half, device)
         # task 由 .pt 文件自动推断为 "segment"
         self._model = YOLO(model_path)
         self._model.to(device)
+        if self._half:
+            self._model.half()
+        logger.info("Detector 初始化: device=%s, half=%s, imgsz=%d", device, self._half, self._imgsz)
         # 跟踪状态标记：是否已经用过 track_frame（用于 reset 时清 tracker 状态）
         self._tracking = False
+
+    @staticmethod
+    def _resolve_half(half: bool | None, device: str) -> bool:
+        if half is not None:
+            return bool(half) and ("cuda" in str(device).lower())
+        return "cuda" in str(device).lower()
 
     # ---- 运行时参数更新（无需重建模型）----
     def set_conf(self, conf: float) -> None:
@@ -85,6 +102,15 @@ class Detector:
         if device != self._device:
             self._device = device
             self._model.to(device)
+            # 设备变化时重新决定 half：CPU→CUDA 自动开 FP16，CUDA→CPU 自动关
+            new_half = self._resolve_half(None, device)
+            if new_half != self._half:
+                self._half = new_half
+                if new_half:
+                    self._model.half()
+                else:
+                    self._model.float()
+                logger.info("device 切换: %s, half=%s", device, self._half)
 
     @property
     def names(self) -> dict[int, str]:
@@ -98,6 +124,7 @@ class Detector:
             iou=self._iou,
             verbose=False,
             imgsz=self._imgsz,
+            half=self._half,
         )
         if self._classes is not None:
             kwargs["classes"] = self._classes
@@ -111,13 +138,16 @@ class Detector:
 
         与 predict_frame 的唯一区别：每框附带 track_id（result.track_ids），
         供统计按唯一目标去重累计，避免重复计数。
+        使用 ByteTrack（比默认 BoT-SORT 轻，GPU 上极快，安防场景足够）。
         """
         kwargs = dict(
             conf=self._conf,
             iou=self._iou,
             verbose=False,
             imgsz=self._imgsz,
+            half=self._half,
             persist=True,
+            tracker="bytetrack.yaml",
         )
         if self._classes is not None:
             kwargs["classes"] = self._classes

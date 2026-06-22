@@ -16,7 +16,7 @@ from __future__ import annotations
 import csv
 import os
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -35,13 +35,18 @@ class StatsCollector:
         self._logs_dir = logs_dir
         self._names: dict[int, str] = names or {}
         self._lock = threading.Lock()
-        self._samples: list[_Sample] = []
+        # 限制最近 30 分钟采样（约 30fps × 1800s），防止无界增长拖慢图表查询。
+        # 旧采样从左端自动丢弃。
+        self._samples: deque = deque(maxlen=54000)
         # 去重累计：track_id -> cls_id；同一 ID 只计入一次
         self._seen_ids: dict[int, int] = {}
         # _class_total 现在反映去重后的『不同目标数』
         self._class_total: dict[int, int] = defaultdict(int)
         self._alarm_total: int = 0
         self._csv_path: str = os.path.join(logs_dir, "stats.csv")
+        # CSV 批量缓冲：攒到阈值或 flush() 时一次性写入，避免每帧 open/close。
+        self._csv_buffer: list[_Sample] = []
+        self._csv_flush_threshold: int = 60  # 约 2 秒（@30fps）落盘一次
         self._ensure_csv_header()
 
     def set_names(self, names: dict[int, str]) -> None:
@@ -85,7 +90,42 @@ class StatsCollector:
                 for cid, n in counts.items():
                     self._class_total[cid] += n
             self._alarm_total += alarms
-        self._append_csv(sample)
+            # CSV 批量缓冲：攒够阈值才落盘，避免每帧 open/close 拖慢推理线程
+            self._csv_buffer.append(sample)
+            need_flush = len(self._csv_buffer) >= self._csv_flush_threshold
+        # 落盘在锁外执行（磁盘 IO 不必持锁）
+        if need_flush:
+            self._flush_csv()
+
+    def flush(self) -> None:
+        """强制把缓冲区剩余采样写入 CSV。停止采集时应调用，避免丢数据。"""
+        self._flush_csv()
+
+    def _flush_csv(self) -> None:
+        """把 _csv_buffer 里的采样批量写入 CSV。线程安全（锁内取快照）。"""
+        with self._lock:
+            if not self._csv_buffer:
+                return
+            batch = self._csv_buffer
+            self._csv_buffer = []
+        try:
+            with open(self._csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                for sample in batch:
+                    dt = datetime.fromtimestamp(sample.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+                    if not sample.counts:
+                        writer.writerow([f"{sample.timestamp:.3f}", dt, "", "", 0, sample.alarms])
+                    for cid, n in sample.counts.items():
+                        writer.writerow([
+                            f"{sample.timestamp:.3f}",
+                            dt,
+                            cid,
+                            self._names.get(cid, str(cid)),
+                            n,
+                            sample.alarms,
+                        ])
+        except OSError:
+            pass
 
     def _ensure_csv_header(self) -> None:
         try:
@@ -98,23 +138,9 @@ class StatsCollector:
             pass
 
     def _append_csv(self, sample: _Sample) -> None:
-        try:
-            dt = datetime.fromtimestamp(sample.timestamp).strftime("%Y-%m-%d %H:%M:%S")
-            with open(self._csv_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                if not sample.counts:
-                    writer.writerow([f"{sample.timestamp:.3f}", dt, "", "", 0, sample.alarms])
-                for cid, n in sample.counts.items():
-                    writer.writerow([
-                        f"{sample.timestamp:.3f}",
-                        dt,
-                        cid,
-                        self._names.get(cid, str(cid)),
-                        n,
-                        sample.alarms,
-                    ])
-        except OSError:
-            pass
+        # 已被 _flush_csv 批量写入取代，保留空实现避免外部（如有）调用报错。
+        # 真正的写入走 record() -> 缓冲 -> _flush_csv()。
+        pass
 
     # ---- 查询 ----
     def class_counts(self) -> dict[str, int]:

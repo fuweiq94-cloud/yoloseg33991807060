@@ -2,8 +2,19 @@
 
 在子线程读取帧 + YOLO 推理 + ROI 判定 + 统计，通过信号通知 UI。
 不在此线程画 ROI 叠加（交由 VideoCanvas 用 QPainter 画，更灵活且支持交互）。
+
+性能要点：
+- 采集与推理解耦：_CaptureThread 独立读取相机/视频帧，只保留「最新一帧」
+  （覆盖式单槽）。VideoWorker 主循环从最新帧消费，旧帧自动丢弃。
+  这样即使某帧推理慢，下一帧也是相机当前画面，不会累积滞后。
+- 打开后立即设 CAP_PROP_BUFFERSIZE=1，避免 OpenCV 内部缓冲堆积旧帧。
+- Windows 下摄像头用 DSHOW 后端，降低打开延迟。
+- frame_ready 发射前对 annotated 做 .copy()，避免与 ultralytics 内部
+  缓冲跨线程共享导致撕裂。
 """
 from __future__ import annotations
+
+import threading
 
 import cv2
 import numpy as np
@@ -21,31 +32,95 @@ from app.workers._frame_pipeline import process_frame
 logger = get_logger()
 
 
+class _CaptureThread(QThread):
+    """独立的帧采集线程：持续 read，只保留最新一帧（覆盖式）。
+
+    与推理线程解耦：相机/流持续推帧时，OpenCV 内部缓冲会堆积旧帧；
+    本线程高频 read 把最新帧写入单槽，旧的被覆盖。推理线程取到的永远
+    是「当下」的画面，消除「越来越滞后」的累积延迟。
+    """
+
+    def __init__(self, source, parent=None) -> None:
+        super().__init__(parent)
+        self._source = source
+        self._stop_flag = False
+        self._lock = threading.Lock()
+        self._latest: np.ndarray | None = None      # 最新帧（受锁保护）
+        self._ok = False                             # 最近一次 read 是否成功
+        self._cap: cv2.VideoCapture | None = None
+
+    def run(self) -> None:
+        # 摄像头（int 源）在 Windows 下用 DSHOW 后端降低延迟；视频文件/RTSP 用默认。
+        is_camera = not isinstance(self._source, str)
+        if is_camera:
+            cap = cv2.VideoCapture(self._source, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(self._source)
+        # 关键：把 OpenCV 内部缓冲压到最小，read() 拿到的就是最新帧而非积压的旧帧。
+        # 不是所有后端都支持，忽略失败即可。
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        if not cap.isOpened():
+            self._ok = False
+            return
+        self._cap = cap
+
+        while not self._stop_flag:
+            ok, frame = cap.read()
+            if not ok:
+                # 视频文件读到末尾或流断开
+                with self._lock:
+                    self._ok = False
+                    self._latest = None
+                break
+            with self._lock:
+                self._latest = frame
+                self._ok = True
+
+        cap.release()
+
+    def take(self) -> tuple[bool, np.ndarray | None]:
+        """取走最新帧（并清空，避免同一帧被推理两次）。返回 (ok, frame)。"""
+        with self._lock:
+            frame = self._latest
+            ok = self._ok
+            self._latest = None  # 消费后清空，直到采集线程写入新帧
+        return ok, frame
+
+    def stop(self) -> None:
+        self._stop_flag = True
+
+    @property
+    def is_open(self) -> bool:
+        """源是否成功打开（打开尝试过后才准确）。"""
+        return self._cap is not None and self._cap.isOpened()
+
+
 class VideoWorker(QThread):
-    """摄像头/视频文件的推理循环线程。
+    """视频/摄像头推理。
 
     信号：
-        frame_ready(ndarray annotated, list violator_box_indices, ndarray centers)
-            —— 标注帧 + 进入ROI的框索引 + 所有框中心点（供画布画ROI高亮）
-        stats_ready(dict)
-            —— 采样统计 {counts: {cls:n}, alarms: n}
-        alarm_ready(int roi_id, list cls_ids, list confs)
-            —— 触发报警
-        fps_updated(float)
-        error_occurred(str)
-        finished_source()  —— 视频/图片处理完毕
+    - frame_ready(ndarray annotated, list violator_indices, object centers)
+    - stats_ready(dict {"counts":..., "alarms":...})
+    - fps_updated(float)
+    - alarm_ready(int roi_id, list cls_ids, list confs)
+    - error_occurred(str)
+    - finished_source()  视频文件读到末尾
     """
 
     frame_ready = pyqtSignal(np.ndarray, list, object)
     stats_ready = pyqtSignal(dict)
-    alarm_ready = pyqtSignal(int, list, list)
     fps_updated = pyqtSignal(float)
+    alarm_ready = pyqtSignal(int, list, list)
     error_occurred = pyqtSignal(str)
     finished_source = pyqtSignal()
 
     def __init__(
         self,
-        source,                       # int(摄像头) 或 str(视频路径)
+        source,
         detector: Detector,
         roi_manager: RoiManager,
         stats: StatsCollector,
@@ -58,13 +133,11 @@ class VideoWorker(QThread):
         self._roi = roi_manager
         self._stats = stats
         self._alarm = alarm
-        self._fps = FpsCounter(window=30)
-
-        # 控制标志（主线程写、工作线程读；单一写者，无需加锁）
+        self._fps = FpsCounter()
         self._stop_flag = False
         self._pause_flag = False
+        self._capture: _CaptureThread | None = None
 
-    # ---- 控制 ----
     def pause(self) -> None:
         self._pause_flag = True
 
@@ -74,6 +147,8 @@ class VideoWorker(QThread):
     def stop(self) -> None:
         self._stop_flag = True
         self._pause_flag = False
+        if self._capture is not None:
+            self._capture.stop()
 
     @property
     def source(self):
@@ -82,27 +157,52 @@ class VideoWorker(QThread):
     def update_source(self, source) -> None:
         self._source = source
 
-    # ---- 主循环 ----
     def run(self) -> None:
-        cap = cv2.VideoCapture(self._source)
-        if not cap.isOpened():
-            self.error_occurred.emit(f"无法打开数据源: {self._source}")
+        # 先启动采集线程；它会负责打开源、设置缓冲区、持续 read。
+        self._capture = _CaptureThread(self._source)
+        self._capture.start()
+
+        # 等待采集线程打开源（给一段窗口）。打开是同步发生在 run() 开头，
+        # 所以短时间内 is_open 就会变 True 或采集线程退出。
+        for _ in range(100):  # 最多等 ~1s
+            if self._stop_flag:
+                break
+            # 采集线程已确定结果（打开成功继续运行，或打开失败已退出）
+            if self._capture.is_open or not self._capture.isRunning():
+                break
+            self.msleep(10)
+
+        # 判定源是否成功打开
+        if not self._capture.is_open:
+            if not self._stop_flag:
+                self.error_occurred.emit(f"无法打开数据源: {self._source}")
+            self._capture.wait()
             return
 
         logger.info("VideoWorker 启动，源=%s", self._source)
+
         while not self._stop_flag:
-            # 暂停：空转等待
+            # 暂停：丢弃新帧，空转等待
             if self._pause_flag:
+                # 暂停时也要消费掉采集线程不断推来的帧，避免缓冲膨胀
+                self._capture.take()
                 self.msleep(30)
                 continue
 
-            ok, frame = cap.read()
-            if not ok:
-                # 视频文件读到末尾
-                if isinstance(self._source, str):
-                    logger.info("视频处理完毕")
-                    self.finished_source.emit()
-                break
+            # 取最新帧（旧的已被采集线程覆盖 / 上次 take 清空）
+            ok, frame = self._capture.take()
+            if frame is None:
+                # 暂时没有新帧：可能是推理比采集快。短暂等待，避免空转烧 CPU。
+                # 区分两种情况：采集线程还在跑（等待新帧） vs 已结束（文件 EOF / 流断开）。
+                if self._capture.isRunning():
+                    self.msleep(1)
+                    continue
+                else:
+                    # 采集线程已退出
+                    if isinstance(self._source, str) and not ok:
+                        logger.info("视频处理完毕")
+                        self.finished_source.emit()
+                    break
 
             try:
                 result = self._detector.track_frame(frame)
@@ -122,10 +222,15 @@ class VideoWorker(QThread):
             self._fps.tick()
             self.fps_updated.emit(self._fps.fps())
 
-            # 发帧（annotated + 违反框索引 + 中心点用于画布交互）
-            self.frame_ready.emit(result.annotated, outcome.violator_indices, outcome.centers)
+            # 发帧：annotated 必须 copy，否则跨线程与 ultralytics 内部缓冲共享会撕裂。
+            # centers 是本次推理新算出的 ndarray，所有权独占，无需 copy。
+            self.frame_ready.emit(
+                result.annotated.copy(), outcome.violator_indices, outcome.centers,
+            )
 
-        cap.release()
+        # 收尾：停采集线程
+        self._capture.stop()
+        self._capture.wait()
         logger.info("VideoWorker 结束")
 
     # 不实现 __del__：解释器关闭阶段 C++ 对象可能已销毁，

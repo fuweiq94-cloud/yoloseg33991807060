@@ -59,6 +59,19 @@ _auto_use_venv()
 import torch  # noqa: F401,E402
 from ultralytics import YOLO  # noqa: F401,E402
 
+# 启动诊断：让用户第一眼看到 torch 是否支持 CUDA，
+# 避免再次出现「以为用 GPU 其实是 CPU 版 torch」的情况。
+_cuda_ok = torch.cuda.is_available()
+print(
+    f"[启动诊断] torch={torch.__version__} "
+    f"CUDA={'可用 -> ' + torch.cuda.get_device_name(0) if _cuda_ok else '不可用 (CPU-only 构建)'}"
+)
+if not _cuda_ok:
+    print(
+        "[启动诊断] 提示：当前为 CPU 版 torch。如需 GPU 加速，请安装 CUDA 版："
+        " pip install torch --index-url https://download.pytorch.org/whl/cu121"
+    )
+
 
 def main() -> int:
     from PyQt5.QtWidgets import QApplication

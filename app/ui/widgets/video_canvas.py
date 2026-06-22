@@ -81,20 +81,34 @@ class VideoCanvas(QLabel):
 
     # ---- 公共接口 ----
     def update_frame(self, frame_bgr: np.ndarray) -> None:
-        """更新显示帧（BGR ndarray）。"""
+        """更新显示帧（BGR ndarray）。
+
+        用 Format_BGR888 直接包装连续内存（仅当帧非连续时才做一次拷贝），
+        相比先 [:, :, ::-1] 转 RGB 再 ascontiguousarray，省掉一次全图拷贝。
+        QImage 仅持有 ndarray 的视图，.copy() 把数据搬进 Qt 后 ndarray 即可被回收。
+        """
         if frame_bgr is None or frame_bgr.size == 0:
             return
-        rgb = np.ascontiguousarray(frame_bgr[:, :, ::-1])
-        h, w, ch = rgb.shape
+        # 确保内存连续：QImage 要求 strides 匹配 bytesPerLine
+        if not frame_bgr.flags["C_CONTIGUOUS"]:
+            frame_bgr = np.ascontiguousarray(frame_bgr)
+        h, w = frame_bgr.shape[:2]
         self._frame_size = (w, h)
-        img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+        img = QImage(frame_bgr.data, w, h, w * 3, QImage.Format_BGR888).copy()
         self._pixmap = QPixmap.fromImage(img)
         self.setText("")
         self.update()
 
     def set_rois(self, rois: List[List[Tuple[float, float]]]) -> None:
-        """设置已有 ROI 列表（原始帧像素坐标）。"""
-        self._rois = [list(r) for r in rois]
+        """设置已有 ROI 列表（原始帧像素坐标）。
+
+        内容未变时跳过赋值与重绘（_on_frame 每帧都会调用，但 ROI 只在用户
+        增删时变化，去抖可避免每帧多触发一次 update）。
+        """
+        new_rois = [list(r) for r in rois]
+        if new_rois == self._rois:
+            return
+        self._rois = new_rois
         self.update()
 
     def set_violators(
@@ -183,15 +197,16 @@ class VideoCanvas(QLabel):
         for roi_pts in self._rois:
             self._draw_roi(painter, roi_pts, ox, oy, dw, dh, alarm=False)
 
-        # 画违反目标红框
+        # 画违反目标红框（pen/brush 在循环外构造一次，避免每个框重复 new）
         pen = QPen(QColor(self._palette.alarm), 3)
+        brush = QBrush(QColor(217, 48, 37, 50))
         painter.setPen(pen)
+        painter.setBrush(brush)
         for (x1, y1, x2, y2) in self._violator_boxes:
             sx1 = ox + x1 / self._frame_size[0] * dw if self._frame_size[0] else x1
             sy1 = oy + y1 / self._frame_size[1] * dh if self._frame_size[1] else y1
             sx2 = ox + x2 / self._frame_size[0] * dw if self._frame_size[0] else x2
             sy2 = oy + y2 / self._frame_size[1] * dh if self._frame_size[1] else y2
-            painter.setBrush(QBrush(QColor(217, 48, 37, 50)))
             painter.drawRect(int(sx1), int(sy1), int(sx2 - sx1), int(sy2 - sy1))
 
         # 画当前正在绘制的多边形

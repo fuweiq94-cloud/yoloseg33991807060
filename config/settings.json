@@ -1,7 +1,7 @@
 {
   "detection": {
     "model_path": "assets/models/yolo26s-seg.pt",
-    "device": "cpu",
+    "device": "cuda:0",
     "conf": 0.45,
     "iou": 0.5,
     "classes": [0],

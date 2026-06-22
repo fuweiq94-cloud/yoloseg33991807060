@@ -94,6 +94,16 @@ class MainWindow(QMainWindow):
         self._clock.timeout.connect(self._tick_clock)
         self._clock.start()
 
+        # 统计刷新节流：worker 每帧 emit stats_ready，但全量查询(_samples 遍历)
+        # 很贵。这里用 1Hz 定时器统一刷新，_on_stats 只标记脏数据。
+        # 同一定时器顺带刷新 FPS/目标数状态文字（每帧 setText 无意义且昂贵）。
+        self._stats_dirty = False
+        self._status_dirty = False
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setInterval(1000)
+        self._stats_timer.timeout.connect(self._refresh_periodic)
+        self._stats_timer.start()
+
         # 配置变更监听
         self._cfg.add_listener(self._on_config_changed)
 
@@ -105,6 +115,8 @@ class MainWindow(QMainWindow):
         self._cur_fps = 0.0
         self._cur_objs = 0
         self._cur_alarm = False
+        # 最近一帧缓存：ROI 页按需显示时补帧用（避免给隐藏画布每帧做昂贵转换）
+        self._last_frame: tuple | None = None  # (annotated, violator_indices, centers)
 
         self._build_bottom_toolbar()
         # 隐藏系统原生菜单栏：改用底部工具条承载同样的快捷操作
@@ -414,6 +426,12 @@ class MainWindow(QMainWindow):
         if 0 <= row < self.stack.count():
             self.stack.setCurrentIndex(row)
             self._refresh_nav_icons()
+            # 切到 ROI 页时补一帧最近缓存，保证画布不是空白
+            if self.stack.currentWidget() is self.page_roi and self._last_frame is not None:
+                annotated, violator_indices, centers = self._last_frame
+                rois = [r.points for r in self._roi_manager.regions]
+                self.page_roi.update_frame(annotated, violator_indices, centers)
+                self.page_roi.set_rois(rois)
 
     # ====================================================================
     # 检测器懒加载
@@ -425,9 +443,10 @@ class MainWindow(QMainWindow):
         model_path = self._abs_path(model_rel)
         try:
             self.lbl_status.setText("正在加载模型…")
+            device = self._resolve_device(self._cfg.get("detection.device", "cpu"))
             self._detector = Detector(
                 model_path=model_path,
-                device=self._cfg.get("detection.device", "cpu"),
+                device=device,
                 conf=self._cfg.get("detection.conf", 0.45),
                 iou=self._cfg.get("detection.iou", 0.5),
                 classes=self._cfg.get("detection.classes", [0]),
@@ -446,6 +465,28 @@ class MainWindow(QMainWindow):
             logger.exception("检测器初始化失败")
             self.lbl_status.setText(f"模型加载失败: {e}")
             QMessageBox.critical(self, "初始化失败", f"模型加载失败：\n{e}")
+
+    @staticmethod
+    def _resolve_device(configured: str) -> str:
+        """根据 torch 实际能力解析最终 device。
+
+        配置了 cuda 但当前 torch 是 CPU-only / 无可用 GPU 时，回退 cpu，
+        避免 RuntimeError 让程序无法启动。每次启动都打印一次实际设备，
+        防止「以为用了 GPU 其实没有」。
+        """
+        import torch
+        want_cuda = "cuda" in str(configured).lower()
+        if want_cuda:
+            if torch.cuda.is_available():
+                logger.info("设备: %s (GPU=%s)", configured, torch.cuda.get_device_name(0))
+                return configured
+            logger.warning(
+                "配置要求 device=%s 但 torch.cuda.is_available()=False"
+                "（可能是 CPU-only 版 torch），回退到 cpu。", configured,
+            )
+            return "cpu"
+        logger.info("设备: cpu")
+        return "cpu"
 
     def _build_alarm_engine(self) -> None:
         cfg = self._cfg
@@ -560,18 +601,28 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._worker = None
+        # 停止时把统计缓冲区的剩余采样落盘，避免丢失最近几秒数据
+        try:
+            self._stats.flush()
+        except Exception:
+            pass
 
     # ====================================================================
     # Worker 信号 -> 路由到页面
     # ====================================================================
     def _on_frame(self, annotated: np.ndarray, violator_indices, centers) -> None:
         rois = [r.points for r in self._roi_manager.regions]
-        # 检测页
-        self.page_detection.update_frame(annotated, violator_indices, centers)
-        self.page_detection.set_rois(rois)
-        # ROI 页（共享同一帧）
-        self.page_roi.update_frame(annotated, violator_indices, centers)
-        self.page_roi.set_rois(rois)
+        # 缓存最近一帧（切到 ROI 页时补帧用）
+        self._last_frame = (annotated, violator_indices, centers)
+        # 只给当前可见页喂帧：隐藏页的 VideoCanvas 不做昂贵的 np→QImage→QPixmap 转换，
+        # 避免同一帧被渲染两次。切页时由 _on_nav_changed 补帧。
+        current = self.stack.currentWidget()
+        if current is self.page_detection:
+            self.page_detection.update_frame(annotated, violator_indices, centers)
+            self.page_detection.set_rois(rois)
+        elif current is self.page_roi:
+            self.page_roi.update_frame(annotated, violator_indices, centers)
+            self.page_roi.set_rois(rois)
         # 状态读数
         try:
             n_objs = len(centers) if centers is not None else 0
@@ -579,18 +630,32 @@ class MainWindow(QMainWindow):
             n_objs = 0
         self._cur_objs = n_objs
         self._cur_alarm = bool(violator_indices)
-        self.page_detection.update_status(self._cur_fps, n_objs, self._cur_alarm)
+        # 状态文字节流：只标记脏，由 _stats_timer(1Hz) 统一刷新，避免每帧 setText
+        self._status_dirty = True
 
     def _on_stats(self, data: dict) -> None:
-        p = self.page_stats
-        p.update_class_counts(self._stats.class_counts())
-        p.update_class_ratio(self._stats.class_ratio())
-        labels, values = self._stats.time_series(bin_seconds=30)
-        p.update_time_series(labels, values)
-        a_labels, a_values = self._stats.alarm_trend(bin_seconds=30)
-        p.update_alarm_trend(a_labels, a_values)
-        p.update_alarm_total(self._stats.alarm_total)
-        p.mark_stats_dirty()
+        # 节流：每帧到达只标记脏数据，真正的全量查询交给 1Hz 的 _stats_timer。
+        # 避免 _samples 无界增长时每帧遍历几万条采样拖垮主线程。
+        self._stats_dirty = True
+
+    def _refresh_periodic(self) -> None:
+        """1Hz 周期刷新：统计图表 + 状态文字。把每帧的昂贵工作收敛到这里。"""
+        if self._stats_dirty:
+            self._stats_dirty = False
+            p = self.page_stats
+            p.update_class_counts(self._stats.class_counts())
+            p.update_class_ratio(self._stats.class_ratio())
+            labels, values = self._stats.time_series(bin_seconds=30)
+            p.update_time_series(labels, values)
+            a_labels, a_values = self._stats.alarm_trend(bin_seconds=30)
+            p.update_alarm_trend(a_labels, a_values)
+            p.update_alarm_total(self._stats.alarm_total)
+            p.mark_stats_dirty()
+        if self._status_dirty:
+            self._status_dirty = False
+            self.page_detection.update_status(
+                self._cur_fps, self._cur_objs, self._cur_alarm,
+            )
 
     def _on_alarm_ready(self, roi_id: int, cls_ids: list, confs: list) -> None:
         self._cur_alarm = True
@@ -599,7 +664,9 @@ class MainWindow(QMainWindow):
 
     def _on_fps(self, fps: float) -> None:
         self._cur_fps = fps
-        self.page_detection.update_status(fps, self._cur_objs, self._cur_alarm)
+        # 不每帧刷新状态文字（人眼无法分辨 30Hz 文字刷新，setText 会触发 layout+repaint）。
+        # 实际刷新交给 _stats_timer（1Hz）里的 _refresh_status()。
+        self._status_dirty = True
 
     def _on_error(self, msg: str) -> None:
         logger.error("worker 错误: %s", msg)
