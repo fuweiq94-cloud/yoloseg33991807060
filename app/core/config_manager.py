@@ -96,8 +96,9 @@ class ConfigManager:
 
     @staticmethod
     def _project_root() -> str:
-        # app/core/config_manager.py -> 上溯两级得到项目根
-        return os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        # app/core/config_manager.py -> 上溯三级得到项目根
+        # （core -> app -> <项目根>）
+        return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     # ---- 读写 ----
     def reload(self) -> None:
