@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import (
 
 from app.ui.pages.base_page import BasePage
 from app.ui.widgets.video_canvas import VideoCanvas
+from app.ui.widgets.video_playback_bar import VideoPlaybackBar
 from app.ui.widgets.svg_icon import load_svg_icon
 
 
@@ -28,6 +29,9 @@ class RoiPage(BasePage):
     roi_created = pyqtSignal(list)        # 画布点选闭合 -> 透传顶点（帧像素坐标）
     import_requested = pyqtSignal()
     export_requested = pyqtSignal()
+    # 视频内联播放控件信号（透传给 MainWindow，与检测页一致）
+    video_play_toggled = pyqtSignal()
+    video_seek_requested = pyqtSignal(int)
 
     def _build_content(self) -> None:
         tip = QLabel("点击「新建多边形」后，在画面上单击添加顶点，双击或回车闭合，ESC 取消。")
@@ -37,11 +41,21 @@ class RoiPage(BasePage):
 
         main = QSplitter(Qt.Horizontal)
 
-        # 独立画布
+        # 左侧：独立画布 + 视频内联播放控件
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
         self.canvas = VideoCanvas()
         self.canvas.set_palette(self.palette)
         self.canvas.roi_created.connect(self.roi_created.emit)
-        main.addWidget(self.canvas)
+        left_layout.addWidget(self.canvas, 1)
+        self.playback_bar = VideoPlaybackBar()
+        self.playback_bar.hide()  # 仅视频文件源显示
+        self.playback_bar.play_toggled.connect(self.video_play_toggled.emit)
+        self.playback_bar.seek_requested.connect(self.video_seek_requested.emit)
+        left_layout.addWidget(self.playback_bar)
+        main.addWidget(left)
 
         # 侧栏：操作 + 列表
         sidebar = self._build_sidebar()
@@ -109,6 +123,24 @@ class RoiPage(BasePage):
         # ROI 页同样显示当前画面，便于对照绘制
         self.canvas.update_frame(annotated)
         self.canvas.set_violators(centers, violator_indices)
+
+    # ---- 视频内联播放控件（与检测页一致）----
+    def set_video_mode(self, enabled: bool, frame_count: int = 0, fps: float = 0.0) -> None:
+        """启用/禁用视频内联播放控件。仅视频文件源启用。"""
+        self.playback_bar.setVisible(enabled)
+        if enabled:
+            self.playback_bar.set_range(frame_count, fps)
+            self.playback_bar.reset()
+
+    def set_video_position(self, frame_idx: int) -> None:
+        """worker 推进时更新进度条位置。"""
+        if self.playback_bar.isVisible():
+            self.playback_bar.set_position(frame_idx)
+
+    def set_video_playing(self, playing: bool) -> None:
+        """播放/暂停状态回灌（与顶部 ControlBar 同步）。"""
+        if self.playback_bar.isVisible():
+            self.playback_bar.set_playing(playing)
 
     def set_rois(self, rois) -> None:
         self.canvas.set_rois(rois)

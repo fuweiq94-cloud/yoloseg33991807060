@@ -320,12 +320,18 @@ class MainWindow(QMainWindow):
     def _wire_pages(self) -> None:
         # 检测页：类别筛选变化
         self.page_detection.classes_changed.connect(self._on_classes_changed)
+        # 检测页：视频内联播放控件（与顶部 ControlBar 等效）
+        self.page_detection.video_play_toggled.connect(self._on_play_toggled)
+        self.page_detection.video_seek_requested.connect(self._on_seek_requested)
 
         # ROI 页：用户操作
         self.page_roi.roi_created.connect(self._on_roi_created)
         self.page_roi.clear_roi_requested.connect(self._clear_roi)
         self.page_roi.import_requested.connect(self._import_roi)
         self.page_roi.export_requested.connect(self._export_roi)
+        # ROI 页：视频内联播放控件（与检测页共享同一 worker）
+        self.page_roi.video_play_toggled.connect(self._on_play_toggled)
+        self.page_roi.video_seek_requested.connect(self._on_seek_requested)
 
         # 历史页：注入数据源
         self.page_history.set_history_manager(self._history)
@@ -553,6 +559,11 @@ class MainWindow(QMainWindow):
         # 重置保存状态：新一次识别开始，清除上次的录制结果
         self._cur_record = None
         self.control_bar.set_save_enabled(False)
+        # 视频内联播放控件：仅视频文件源显示（先显示控件占位，范围由首个
+        # progress_updated 信号到达时校正——此时采集线程已打开源、frame_count 可读）
+        is_video = src_type == SourceType.VIDEO
+        self.page_detection.set_video_mode(is_video)
+        self.page_roi.set_video_mode(is_video)
         # 记录当前源信息（供保存时写历史元数据）
         self._cur_source_type = src_type
         if src_type == SourceType.IMAGE:
@@ -600,6 +611,8 @@ class MainWindow(QMainWindow):
             worker.fps_updated.connect(self._on_fps)
         if hasattr(worker, "video_recorded"):
             worker.video_recorded.connect(self._on_video_recorded)
+        if hasattr(worker, "progress_updated"):
+            worker.progress_updated.connect(self._on_progress)
 
     def _sync_detector_params(self) -> None:
         if self._detector is None:
@@ -616,16 +629,55 @@ class MainWindow(QMainWindow):
         if self._worker and hasattr(self._worker, "pause"):
             self._worker.pause()
             self.lbl_status.setText("已暂停")
+        # 内联播放控件同步为「暂停」态
+        self.page_detection.set_video_playing(False)
+        self.page_roi.set_video_playing(False)
 
     def _on_resume(self) -> None:
         if self._worker and hasattr(self._worker, "resume"):
             self._worker.resume()
             self.lbl_status.setText("检测中")
+        # 内联播放控件同步为「播放」态
+        self.page_detection.set_video_playing(True)
+        self.page_roi.set_video_playing(True)
+
+    def _on_play_toggled(self) -> None:
+        """检测页/ROI 页内联播放按钮被点击：切换 worker 暂停/继续。
+        与顶部 ControlBar 的暂停/继续等效，二者状态由各自按钮分别表达。"""
+        if not (self._worker and hasattr(self._worker, "_pause_flag")):
+            return
+        if getattr(self._worker, "_pause_flag", False):
+            self._on_resume()
+        else:
+            self._on_pause()
+
+    def _on_seek_requested(self, frame_idx: int) -> None:
+        """检测页/ROI 页进度条拖动：跳转 worker 到指定帧。"""
+        if self._worker and hasattr(self._worker, "seek"):
+            self._worker.seek(frame_idx)
+
+    def _on_progress(self, cur: int, total: int) -> None:
+        """worker 推进：更新可见页的进度条位置。
+        首次到达时 total 已知，补校正进度条范围（_on_start 时还读不到 frame_count）。"""
+        # 范围初始化：start 时是 (0,0)，首帧 progress 到达后校正一次
+        if total > 0:
+            fps = getattr(self._worker, "source_fps", 0.0) if self._worker else 0.0
+            for page in (self.page_detection, self.page_roi):
+                bar = page.playback_bar
+                if bar.isVisible() and bar.frame_count != total:
+                    bar.set_range(total, fps)
+        # 只更新可见页的位置（隐藏页不刷，避免无谓重绘）
+        current = self.stack.currentWidget()
+        if current in (self.page_detection, self.page_roi):
+            current.set_video_position(cur)
 
     def _on_stop(self) -> None:
         self._stop_worker()
         self.control_bar.on_stopped()
         self.lbl_status.setText("已停止")
+        # 停止后隐藏内联播放控件（下次开始时会按源类型重新显示）
+        self.page_detection.set_video_mode(False)
+        self.page_roi.set_video_mode(False)
 
     def _stop_worker(self) -> None:
         if self._worker is not None:

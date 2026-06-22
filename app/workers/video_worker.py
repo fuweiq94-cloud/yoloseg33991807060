@@ -69,6 +69,10 @@ class _CaptureThread(QThread):
         self._queue: deque = deque()
         self._cap: cv2.VideoCapture | None = None
         self._source_fps: float = 0.0
+        self._frame_count: int = 0
+        # seek 请求：VideoWorker 设置后，本线程在下次 read 前「重定位采集位置 +
+        # 清空背压队列」。None 表示无待处理的 seek。仅视频文件源有效。
+        self._seek_req: int | None = None
 
     def run(self) -> None:
         # 摄像头（int 源）在 Windows 下用 DSHOW 后端降低延迟；视频文件/RTSP 用默认。
@@ -93,8 +97,29 @@ class _CaptureThread(QThread):
             self._source_fps = float(fps) if fps and fps > 0 else 0.0
         except Exception:
             self._source_fps = 0.0
+        # 读总帧数，供进度条显示总时长 / seek 边界检查。
+        try:
+            fc = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            self._frame_count = int(fc) if fc and fc > 0 else 0
+        except Exception:
+            self._frame_count = 0
 
         while not self._stop_flag:
+            # seek 请求处理（仅视频文件源有）：重定位 cv2 指针 + 清空背压队列，
+            # 让后续 read 从新位置产出，消费者也不会拿到 seek 前的陈旧帧。
+            # 生产者侧处理最干净——读循环是串行的，此时没有并发 read。
+            if self._seek_req is not None:
+                target = self._seek_req
+                self._seek_req = None
+                with self._cond:
+                    self._queue.clear()
+                    self._cond.notify_all()
+                if 0 <= target < max(1, self._frame_count):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                # 复位「读到末尾」标记：seek 后即使之前 EOF，也可继续读
+                with self._cond:
+                    self._ok = True
+
             ok, frame = cap.read()
             if not ok:
                 # 视频文件读到末尾或流断开
@@ -139,6 +164,15 @@ class _CaptureThread(QThread):
             self._stop_flag = True
             self._cond.notify_all()  # 唤醒因背压阻塞的生产者，使其能及时退出
 
+    def request_seek(self, frame_idx: int) -> None:
+        """请求 seek 到指定帧。仅视频文件源有意义。实际重定位由生产者线程在
+        下一次 read 前执行（见 run()）。清空背压队列在请求时即完成，避免消费者
+        在 seek 落地前又消费到旧帧。"""
+        with self._cond:
+            self._queue.clear()
+            self._cond.notify_all()
+            self._seek_req = frame_idx
+
     @property
     def is_open(self) -> bool:
         """源是否成功打开（打开尝试过后才准确）。"""
@@ -148,6 +182,11 @@ class _CaptureThread(QThread):
     def source_fps(self) -> float:
         """源视频的帧率（文件打开后才有效）；摄像头为 0.0。"""
         return self._source_fps
+
+    @property
+    def frame_count(self) -> int:
+        """源视频总帧数（文件打开后才有效，可能为 0 表示读不到）；摄像头为 0。"""
+        return self._frame_count
 
 
 class VideoWorker(QThread):
@@ -161,6 +200,8 @@ class VideoWorker(QThread):
     - error_occurred(str)
     - finished_source()  视频文件读到末尾
     - video_recorded(str tmp_path, float duration)  录制完成（带标注的临时视频）
+    - progress_updated(int cur_frame, int total_frames)  仅视频文件源发，
+      用于驱动检测页/ROI 页内联进度条。cur_frame 为已推理帧的序号（从 1 起）。
     """
 
     frame_ready = pyqtSignal(np.ndarray, list, object)
@@ -170,6 +211,7 @@ class VideoWorker(QThread):
     error_occurred = pyqtSignal(str)
     finished_source = pyqtSignal()
     video_recorded = pyqtSignal(str, float)
+    progress_updated = pyqtSignal(int, int)
 
     def __init__(
         self,
@@ -198,6 +240,12 @@ class VideoWorker(QThread):
         self._record_fps = float(record_fps)
         self._writer: cv2.VideoWriter | None = None
         self._record_start_ts: float | None = None
+        # 进度：已推理的帧序号。seek 时重置为对应位置，保证进度条与画面一致。
+        self._frame_idx: int = 0
+        # 待应用的 seek 请求（主循环顶部处理）。仅视频文件源有效。
+        self._seek_req: int | None = None
+        # seek 期间暂停往录制文件写入，避免时间倒流污染录制。
+        self._seeking: bool = False
 
     def pause(self) -> None:
         self._pause_flag = True
@@ -211,9 +259,27 @@ class VideoWorker(QThread):
         if self._capture is not None:
             self._capture.stop()
 
+    def seek(self, frame_idx: int) -> None:
+        """请求跳转到指定帧。仅视频文件源有效；相机源 no-op。
+        线程安全：只设置请求标志，实际重定位在主循环顶部执行（单消费者，
+        避免与背压队列并发）。seek 后重置 tracker，避免 track_id 串台。"""
+        if not isinstance(self._source, str):
+            return
+        self._seek_req = max(0, frame_idx)
+
     @property
     def source(self):
         return self._source
+
+    @property
+    def frame_count(self) -> int:
+        """源视频总帧数（采集线程打开源后才有效）；非文件源为 0。"""
+        return self._capture.frame_count if self._capture is not None else 0
+
+    @property
+    def source_fps(self) -> float:
+        """源视频帧率（采集线程打开源后才有效）；非文件源为 0。"""
+        return self._capture.source_fps if self._capture is not None else 0.0
 
     def update_source(self, source) -> None:
         self._source = source
@@ -243,6 +309,23 @@ class VideoWorker(QThread):
         logger.info("VideoWorker 启动，源=%s", self._source)
 
         while not self._stop_flag:
+            # ---- seek 请求处理（主循环顶部 = 唯一消费者，无并发）----
+            if self._seek_req is not None:
+                target = self._seek_req
+                self._seek_req = None
+                self._seeking = True
+                # 让采集线程重定位 + 清空其背压队列
+                self._capture.request_seek(target)
+                # 重置 tracker，避免跳转后旧 track_id 串台
+                try:
+                    self._detector.reset_tracker()
+                except Exception:
+                    pass
+                self._frame_idx = target
+                # seek 后丢弃已入队但还没消费的「旧位置」帧（request_seek 已清空，
+                # 这里再 take 几次兜底，确保下一帧就是新位置的）
+                continue
+
             # 暂停：丢弃新帧，空转等待
             if self._pause_flag:
                 # 暂停时也要消费掉采集线程不断推来的帧，避免缓冲膨胀
@@ -265,6 +348,9 @@ class VideoWorker(QThread):
                         self.finished_source.emit()
                     break
 
+            # seek 落地后的第一帧：清掉 seeking 标志
+            self._seeking = False
+
             try:
                 result = self._detector.track_frame(frame)
             except Exception as e:
@@ -283,9 +369,15 @@ class VideoWorker(QThread):
             self._fps.tick()
             self.fps_updated.emit(self._fps.fps())
 
+            # 进度：仅视频文件源发，驱动检测页/ROI 页内联进度条
+            if isinstance(self._source, str):
+                self._frame_idx += 1
+                total = self._capture.frame_count
+                self.progress_updated.emit(self._frame_idx, total)
+
             # 录制：把带标注的帧写入临时文件（延迟到首帧才知尺寸）
             annotated_for_emit = result.annotated
-            if self._record_path is not None:
+            if self._record_path is not None and not self._seeking:
                 if self._writer is None:
                     h, w = annotated_for_emit.shape[:2]
                     # 用源帧率写录制文件，使「写入帧数 / 帧率」≈ 原片时长
