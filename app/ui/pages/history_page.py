@@ -1,8 +1,9 @@
-"""历史记录页：用 Tab 区分图片/视频，缩略图网格展示，点击查看或播放。
+"""历史记录页：用 Tab 区分图片/视频，缩略图网格展示，点击在右侧内嵌预览。
 
 数据由 HistoryManager 提供（MainWindow 注入）。本页只负责展示与交互：
 - 顶部 Tab：「图片」/「视频」分开查看，不混在一起
-- 双击/回车：图片放大查看 / 视频播放
+- 左右分栏：左侧缩略图网格，右侧内嵌预览面板（图片查看 / 视频播放）
+  双击/右键打开记录后，在右侧同屏预览，不再弹独立窗口
 - 右键菜单：删除单条
 - 顶部按钮：刷新 / 清空全部
 """
@@ -16,11 +17,12 @@ from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QWidget, QMenu, QAction, QAbstractItemView, QMessageBox,
-    QTabWidget,
+    QTabWidget, QSplitter,
 )
 
 from app.ui.pages.base_page import BasePage
 from app.ui.theme import Palette
+from app.ui.widgets.history_preview_pane import HistoryPreviewPane
 from app.ui.widgets.svg_icon import load_svg_icon
 from app.utils.logger import get_logger
 
@@ -94,6 +96,7 @@ class _HistoryGrid(QListWidget):
             if reply == QMessageBox.Yes:
                 self._history.delete(record_id)
                 self._page.refresh()
+                self._page._preview.show_empty()
 
 
 class HistoryPage(BasePage):
@@ -144,11 +147,19 @@ class HistoryPage(BasePage):
         self._empty_hint.setProperty("role", "sub")
         self._empty_hint.setStyleSheet(f"color: {self._palette.fg_sub}; padding: 60px;")
 
-        # Tab：图片 / 视频分开
+        # 主体：左侧 Tab 网格 + 右侧内嵌预览面板（不再弹独立窗口）
+        self._splitter = QSplitter(Qt.Horizontal)
         self._tabs = QTabWidget()
-        # 占位 grid（set_history_manager 后才有数据；构造时先用临时 history 占位避免报错）
+        # 右侧预览面板：双击左侧记录后在此处查看图片/播放视频
+        self._preview = HistoryPreviewPane()
+        self._splitter.addWidget(self._tabs)
+        self._splitter.addWidget(self._preview)
+        self._splitter.setStretchFactor(0, 3)
+        self._splitter.setStretchFactor(1, 4)
+        self._splitter.setSizes([520, 720])
+
         layout.addWidget(self._empty_hint)
-        layout.addWidget(self._tabs, 1)
+        layout.addWidget(self._splitter, 1)
 
         self._root_layout.addLayout(layout, 1)
 
@@ -206,7 +217,7 @@ class HistoryPage(BasePage):
         except Exception:
             return None
 
-    # ---- 打开记录（图片放大 / 视频播放）----
+    # ---- 打开记录（在页面右侧内嵌预览，不再弹独立窗口）----
     def open_record(self, record: "HistoryRecord") -> None:
         if self._history is None:
             return
@@ -220,30 +231,13 @@ class HistoryPage(BasePage):
         if not os.path.isfile(path):
             QMessageBox.warning(self, "文件缺失", f"视频文件不存在：\n{path}")
             return
-        from app.ui.widgets.video_player_dialog import VideoPlayerDialog
-        dlg = VideoPlayerDialog(path, title=f"回放 - {title}", parent=self)
-        dlg.exec_()
+        self._preview.play_video(path, title=title)
 
     def _show_image(self, path: str, title: str) -> None:
         if not os.path.isfile(path):
             QMessageBox.warning(self, "文件缺失", f"图片文件不存在：\n{path}")
             return
-        from PyQt5.QtWidgets import QDialog
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"查看 - {title}")
-        dlg.setModal(True)
-        dlg.resize(900, 700)
-        v = QVBoxLayout(dlg)
-        lbl = QLabel()
-        lbl.setAlignment(Qt.AlignCenter)
-        pm = QPixmap(path)
-        if not pm.isNull():
-            lbl.setPixmap(pm.scaled(900, 700, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        v.addWidget(lbl, 1)
-        btn = QPushButton("关闭")
-        btn.clicked.connect(dlg.accept)
-        v.addWidget(btn)
-        dlg.exec_()
+        self._preview.show_image(path, title=title)
 
     def _on_clear_all(self) -> None:
         if self._history is None:
@@ -255,3 +249,4 @@ class HistoryPage(BasePage):
         if reply == QMessageBox.Yes:
             self._history.clear_all()
             self.refresh()
+            self._preview.show_empty()
