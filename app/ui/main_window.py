@@ -45,6 +45,7 @@ from app.ui.pages.history_page import HistoryPage
 from app.ui.pages.settings_page import SettingsPage
 from app.ui.dialogs.about_dialog import AboutDialog
 from app.ui.widgets.class_filter import load_classes
+from app.plugins import PluginManager, PluginContext, Plugin
 
 logger = get_logger()
 
@@ -129,6 +130,11 @@ class MainWindow(QMainWindow):
         # 当前源类型/名称（供保存时记录来源）
         self._cur_source_name: str = ""
         self._cur_source_type: object = None
+
+        # 插件系统：加载顺序在 _build_central 之后（那时 nav/stack 已就绪）
+        self._plugin_mgr: PluginManager | None = None
+        # 插件页在 stack 中的索引范围（[start, end)，用于事件分发时判断当前页是否插件页）
+        self._plugin_pages: list = []   # list of _LoadedPlugin
 
         self._build_bottom_toolbar()
         # 隐藏系统原生菜单栏：改用底部工具条承载同样的快捷操作
@@ -316,6 +322,8 @@ class MainWindow(QMainWindow):
         self._wire_pages()
         # 应用主题到各页面
         self._apply_theme_to_pages()
+        # 加载插件（在页面栈/导航就绪 + 主题应用之后）
+        self._load_plugins()
 
     def _wire_pages(self) -> None:
         # 检测页：类别筛选变化
@@ -343,6 +351,112 @@ class MainWindow(QMainWindow):
         for page in (self.page_detection, self.page_roi, self.page_stats, self.page_history, self.page_settings):
             page.set_palette(self._palette)
         self._refresh_nav_icons()
+        # 主题变化时也通知已加载的插件（运行期切主题）
+        self._dispatch_plugin_event("on_theme_changed", self._palette)
+
+    # ====================================================================
+    # 插件系统
+    # ====================================================================
+    def _make_plugin_context(self, plugin_name: str, plugin_dir: str) -> PluginContext:
+        """为插件构造 PluginContext（聚合主程序提供的能力）。"""
+        return PluginContext(
+            project_root=self._project_root,
+            plugin_dir=plugin_dir,
+            config=self._cfg,
+            palette=self._palette,
+            detector=self._detector,
+            roi_manager=self._roi_manager,
+            stats=self._stats,
+            history=self._history,
+            alarm=self._alarm,
+            logger=logger,
+            get_last_frame=lambda: self._last_frame,
+            show_status=self.lbl_status.setText,
+        )
+
+    def _load_plugins(self) -> None:
+        """发现并加载 plugins/ 下的所有插件，把页面加进导航 + 页面栈。"""
+        plugins_root = self._abs_path("plugins")
+        self._plugin_mgr = PluginManager(plugins_root)
+        loaded = self._plugin_mgr.load_all(self._make_plugin_context)
+        for lp in loaded:
+            self._register_plugin(lp)
+
+    def _register_plugin(self, lp) -> None:
+        """把单个已加载插件的 widget 加进 stack + nav，并连入事件分发。"""
+        plugin = lp.plugin
+        widget = lp.widget
+        # 把插件页加进页面栈
+        self.stack.addWidget(widget)
+        # 主题应用到插件页（如果它有 set_palette 方法；Plugin 基类不强制）
+        if hasattr(widget, "set_palette"):
+            try:
+                widget.set_palette(self._palette)
+            except Exception:
+                pass
+        # 导航项：构造 icon + 标题，按 nav_after 决定插入位置
+        nav_item = QListWidgetItem("" if self._nav_collapsed else plugin.title)
+        nav_item.setData(Qt.UserRole, plugin)              # 存 Plugin 引用（图标用自定义逻辑）
+        nav_item.setData(Qt.UserRole + 1, plugin.title)    # 标题（折叠/展开切换用）
+        nav_item.setIcon(self._plugin_nav_icon(plugin, selected=False))
+        # nav_after 定位：所有插件都追加到 5 个内置页之后（内置页固定占 nav 前 5 行，
+        # _on_nav_changed 依赖「内置页行号 == stack 索引」这一不变量）。插件之间按
+        # 加载顺序追加。nav_after 保留为元信息但不改变位置，避免破坏内置页行号映射。
+        insert_row = self.nav.count()  # 追加到末尾
+        self.nav.insertItem(insert_row, nav_item)
+        # 注意：插件页通过 UserRole+2 关联 widget；_on_nav_changed 据此用 setCurrentWidget
+        # 切换，而内置页用行号映射 stack 索引（前 5 行）。两者互不干扰。
+        nav_item.setData(Qt.UserRole + 2, widget)
+        self._plugin_pages.append(lp)
+        # 刷新插件页主题
+        try:
+            plugin.on_theme_changed(self._palette)
+        except Exception:
+            logger.exception("插件 on_theme_changed 失败: %s", plugin.name)
+        # 通知插件已就绪
+        try:
+            plugin.on_load()
+        except Exception:
+            logger.exception("插件 on_load 失败: %s", plugin.name)
+        logger.info("插件已注册到导航: %s", plugin.title)
+
+    def _plugin_nav_icon(self, plugin, selected: bool) -> QIcon:
+        """加载插件导航图标。优先级：plugin.icon 指向的 svg 文件（绝对路径或
+        assets/icons 下的名字）；都没有则返回空 QIcon（显示文字）。"""
+        from PyQt5.QtGui import QIcon
+        from app.ui.widgets.svg_icon import _read_svg, _render_pixmap
+        color = "#FFFFFF" if selected else self._palette.fg_sub
+        size = getattr(self, "_nav_icon_px", 28)
+        icon = (plugin.icon or "").strip()
+        if not icon:
+            return QIcon()
+        # 如果是绝对路径或插件目录下的文件，直接读文件内容
+        path = icon
+        if not os.path.isabs(path):
+            # 可能是 assets/icons 下的名字（不带扩展名）
+            builtin = _read_svg(icon)
+            if builtin is not None:
+                return QIcon(_render_pixmap(builtin, color, size))
+            # 也可能是相对插件目录的路径
+            cand = os.path.join(self._project_root, icon)
+            if os.path.isfile(cand):
+                path = cand
+            else:
+                return QIcon()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                svg_text = f.read()
+            return QIcon(_render_pixmap(svg_text, color, size))
+        except OSError:
+            return QIcon()
+
+    def _dispatch_plugin_event(self, method_name: str, *args) -> None:
+        """安全地把一个事件回调分发给所有已加载插件（单个失败不影响其它）。"""
+        for lp in self._plugin_pages:
+            try:
+                getattr(lp.plugin, method_name)(*args)
+            except Exception:
+                logger.exception("插件 %s.%s 失败", lp.plugin.name, method_name)
 
     def _toggle_nav(self) -> None:
         """折叠/展开侧边栏。折叠态仅显示图标，展开态显示图标+文字。"""
@@ -364,14 +478,19 @@ class MainWindow(QMainWindow):
             item.setText("" if collapsed else title)
 
     def _refresh_nav_icons(self) -> None:
-        """刷新所有导航项图标（默认色 + 选中色）。"""
+        """刷新所有导航项图标（默认色 + 选中色）。
+        内置页用 UserRole 存图标名；插件页用 UserRole 存 Plugin 引用。"""
         current = self.nav.currentRow()
         for i in range(self.nav.count()):
             item = self.nav.item(i)
-            name = item.data(Qt.UserRole)
-            if not name:
-                continue
-            item.setIcon(self._nav_icon(name, selected=(i == current)))
+            data = item.data(Qt.UserRole)
+            widget = item.data(Qt.UserRole + 2)
+            if widget is not None and isinstance(data, Plugin):  # 注：Plugin 已在文件头导入
+                # 插件页
+                item.setIcon(self._plugin_nav_icon(data, selected=(i == current)))
+            elif isinstance(data, str):
+                # 内置页（图标名）
+                item.setIcon(self._nav_icon(data, selected=(i == current)))
 
     def _nav_icon(self, name: str, selected: bool) -> QIcon:
         """从 assets/icons/<name>.svg 加载图标，按主题着色。
@@ -447,15 +566,23 @@ class MainWindow(QMainWindow):
         self.nav.setCurrentRow(idx)
 
     def _on_nav_changed(self, row: int) -> None:
-        if 0 <= row < self.stack.count():
+        if not (0 <= row < self.nav.count()):
+            return
+        item = self.nav.item(row)
+        # 优先用 item 关联的 widget（插件页）；内置页无关联，按行号映射
+        widget = item.data(Qt.UserRole + 2)
+        if widget is not None:
+            self.stack.setCurrentWidget(widget)
+        else:
+            # 内置页：前 5 行对应 stack 索引 0..4（与加载顺序一致）
             self.stack.setCurrentIndex(row)
-            self._refresh_nav_icons()
-            # 切到 ROI 页时补一帧最近缓存，保证画布不是空白
-            if self.stack.currentWidget() is self.page_roi and self._last_frame is not None:
-                annotated, violator_indices, centers = self._last_frame
-                rois = [r.points for r in self._roi_manager.regions]
-                self.page_roi.update_frame(annotated, violator_indices, centers)
-                self.page_roi.set_rois(rois)
+        self._refresh_nav_icons()
+        # 切到 ROI 页时补一帧最近缓存，保证画布不是空白
+        if self.stack.currentWidget() is self.page_roi and self._last_frame is not None:
+            annotated, violator_indices, centers = self._last_frame
+            rois = [r.points for r in self._roi_manager.regions]
+            self.page_roi.update_frame(annotated, violator_indices, centers)
+            self.page_roi.set_rois(rois)
 
     # ====================================================================
     # 检测器懒加载
@@ -719,6 +846,21 @@ class MainWindow(QMainWindow):
         self._cur_alarm = bool(violator_indices)
         # 状态文字节流：只标记脏，由 _stats_timer(1Hz) 统一刷新，避免每帧 setText
         self._status_dirty = True
+        # 插件：仅当当前可见页是某个插件页时，分发帧（隐藏插件不收，避免浪费 CPU）
+        lp = self._current_plugin_page()
+        if lp is not None:
+            try:
+                lp.plugin.on_frame(annotated, violator_indices, centers)
+            except Exception:
+                logger.exception("插件 on_frame 失败: %s", lp.plugin.name)
+
+    def _current_plugin_page(self):
+        """若当前可见页是插件页，返回对应的 _LoadedPlugin；否则 None。"""
+        cur = self.stack.currentWidget()
+        for lp in self._plugin_pages:
+            if lp.widget is cur:
+                return lp
+        return None
 
     def _on_stats(self, data: dict) -> None:
         # 节流：每帧到达只标记脏数据，真正的全量查询交给 1Hz 的 _stats_timer。
@@ -896,6 +1038,8 @@ class MainWindow(QMainWindow):
         # 报警提示：底部状态栏内联显示（不弹窗）
         text = ", ".join(names) or "目标"
         self._show_alarm_msg(f"检测到 {text} 进入 ROI{event.roi_id}")
+        # 插件：分发报警事件
+        self._dispatch_plugin_event("on_alarm", event)
 
     # ====================================================================
     # ROI 操作
@@ -1032,6 +1176,8 @@ class MainWindow(QMainWindow):
     # ====================================================================
     def closeEvent(self, event) -> None:
         self._stop_worker()
+        # 插件：退出前释放资源
+        self._dispatch_plugin_event("on_shutdown")
         if self._alarm is not None:
             try:
                 self._alarm.shutdown()
