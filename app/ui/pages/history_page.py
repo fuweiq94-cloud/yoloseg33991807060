@@ -17,7 +17,7 @@ from PyQt5.QtGui import QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QWidget, QMenu, QAction, QAbstractItemView, QMessageBox,
-    QTabWidget, QSplitter,
+    QTabWidget, QSplitter, QComboBox, QLineEdit, QCheckBox,
 )
 
 from app.ui.pages.base_page import BasePage
@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 logger = get_logger()
 
 THUMB_W, THUMB_H = 200, 130  # 网格缩略图尺寸（含文字区）
+PAGE_SIZE = 50               # 每页显示记录数
+TIME_RANGES = ["全部", "今日", "近三天", "近七天"]
 
 
 class _HistoryGrid(QListWidget):
@@ -112,6 +114,9 @@ class HistoryPage(BasePage):
         self._tabs: QTabWidget | None = None
         self._count_label: QLabel | None = None
         self._empty_hint: QLabel | None = None
+        # 筛选/分页状态（会话级，不持久化）
+        self._page: int = 1            # 当前页码（1 起）
+        self._filtered_total: int = 0  # 当前筛选条件下当前 Tab 的总匹配数
         super().__init__(parent)
 
     def set_history_manager(self, history: "HistoryManager") -> None:
@@ -141,6 +146,25 @@ class HistoryPage(BasePage):
         bar.addWidget(self._count_label)
         layout.addLayout(bar)
 
+        # 筛选行：仅看报警 + 时间范围 + 搜索框
+        filt = QHBoxLayout()
+        filt.setSpacing(8)
+        self._chk_alarm = QCheckBox("仅看报警")
+        self._chk_alarm.stateChanged.connect(self._on_filter_changed)
+        filt.addWidget(self._chk_alarm)
+        filt.addWidget(QLabel("时间:"))
+        self._cmb_time = QComboBox()
+        self._cmb_time.addItems(TIME_RANGES)
+        self._cmb_time.currentIndexChanged.connect(self._on_filter_changed)
+        filt.addWidget(self._cmb_time)
+        filt.addWidget(QLabel("搜索:"))
+        self._edt_search = QLineEdit()
+        self._edt_search.setPlaceholderText("搜索来源/类别")
+        self._edt_search.setClearButtonEnabled(True)
+        self._edt_search.textChanged.connect(self._on_filter_changed)
+        filt.addWidget(self._edt_search, 1)
+        layout.addLayout(filt)
+
         # 空状态提示
         self._empty_hint = QLabel("暂无历史记录\n\n进行图片/视频识别后点击「保存」按钮，结果会出现在这里")
         self._empty_hint.setAlignment(Qt.AlignCenter)
@@ -148,15 +172,39 @@ class HistoryPage(BasePage):
         self._empty_hint.setStyleSheet(f"color: {self._palette.fg_sub}; padding: 60px;")
 
         # 主体：左侧 Tab 网格 + 右侧内嵌预览面板（不再弹独立窗口）
+        # 左侧用一个容器包住 tabs + 分页控件，分页控件贴在网格下方
+        self._left_panel = QWidget()
+        left_layout = QVBoxLayout(self._left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
         self._splitter = QSplitter(Qt.Horizontal)
         self._tabs = QTabWidget()
+        self._tabs.currentChanged.connect(self._on_tab_changed)
         # 右侧预览面板：双击左侧记录后在此处查看图片/播放视频
         self._preview = HistoryPreviewPane()
-        self._splitter.addWidget(self._tabs)
+        self._splitter.addWidget(self._left_panel)
         self._splitter.addWidget(self._preview)
         self._splitter.setStretchFactor(0, 3)
         self._splitter.setStretchFactor(1, 4)
         self._splitter.setSizes([520, 720])
+        left_layout.addWidget(self._tabs, 1)
+
+        # 分页控件
+        pager = QHBoxLayout()
+        pager.addStretch(1)
+        self._btn_prev = QPushButton("上一页")
+        self._btn_prev.setProperty("role", "flat")
+        self._btn_prev.clicked.connect(self._on_prev_page)
+        self._lbl_page = QLabel("第 1 / 1 页")
+        self._lbl_page.setStyleSheet(f"color: {self._palette.fg_sub};")
+        self._btn_next = QPushButton("下一页")
+        self._btn_next.setProperty("role", "flat")
+        self._btn_next.clicked.connect(self._on_next_page)
+        pager.addWidget(self._btn_prev)
+        pager.addWidget(self._lbl_page)
+        pager.addWidget(self._btn_next)
+        pager.addStretch(1)
+        left_layout.addLayout(pager)
 
         layout.addWidget(self._empty_hint)
         layout.addWidget(self._splitter, 1)
@@ -175,32 +223,104 @@ class HistoryPage(BasePage):
     def _apply_palette(self) -> None:
         if self._count_label is not None:
             self._count_label.setStyleSheet(f"color: {self._palette.fg_sub};")
+        if self._lbl_page is not None:
+            self._lbl_page.setStyleSheet(f"color: {self._palette.fg_sub};")
         if self._empty_hint is not None:
             self._empty_hint.setStyleSheet(f"color: {self._palette.fg_sub}; padding: 60px;")
 
     # ---- 数据刷新 ----
-    def refresh(self) -> None:
-        """从 HistoryManager 重新加载，按类型分 Tab 展示。"""
+    def _current_type(self) -> str | None:
+        """当前 Tab 对应的类型。0=图片, 1=视频。"""
+        if self._tabs is None:
+            return None
+        return "image" if self._tabs.currentIndex() == 0 else "video"
+
+    def _current_since(self) -> float | None:
+        """时间范围下拉对应的时间戳下限。None=不限。"""
+        if self._cmb_time is None:
+            return None
+        import time as _time
+        days = {"全部": None, "今日": 0, "近三天": 3, "近七天": 7}
+        d = days.get(self._cmb_time.currentText(), None)
+        if d is None:
+            return None
+        if d == 0:  # 今日：取今天 0 点
+            from datetime import datetime
+            now = datetime.now()
+            today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            return today0.timestamp()
+        return _time.time() - d * 86400
+
+    def _apply_filter_and_page(self) -> None:
+        """按当前筛选条件 + 当前 Tab 查询，取当前页切片加载到对应 grid。
+
+        refresh() 的核心：不再全量加载，而是 query + 分页切片。
+        """
         if self._history is None or self._tabs is None:
             return
         self._ensure_grids()
-        records = self._history.all_records()
-        images = [r for r in records if r.type == "image"]
-        videos = [r for r in records if r.type == "video"]
-        # 计数标签
-        self._count_label.setText(
-            f"共 {len(records)} 条 · 图片 {len(images)} · 视频 {len(videos)}"
+        rtype = self._current_type()
+        matched = self._history.query(
+            type=rtype,
+            alarm_only=self._chk_alarm.isChecked(),
+            since=self._current_since(),
+            keyword=self._edt_search.text(),
         )
-        # 空状态：完全无记录时显示提示，隐藏 Tab
-        has_any = len(records) > 0
+        self._filtered_total = len(matched)
+        # 分页切片
+        total_pages = max(1, (self._filtered_total + PAGE_SIZE - 1) // PAGE_SIZE)
+        if self._page > total_pages:
+            self._page = total_pages
+        if self._page < 1:
+            self._page = 1
+        offset = (self._page - 1) * PAGE_SIZE
+        page_records = matched[offset:offset + PAGE_SIZE]
+        # 加载到对应 grid
+        if rtype == "image":
+            self._grid_image.load(page_records)
+            self._grid_video.load([])
+        else:
+            self._grid_video.load(page_records)
+            self._grid_image.load([])
+        # 计数 + 页码
+        self._count_label.setText(
+            f"共 {self._filtered_total} 条（筛选后）"
+        )
+        self._lbl_page.setText(f"第 {self._page} / {total_pages} 页")
+        self._btn_prev.setEnabled(self._page > 1)
+        self._btn_next.setEnabled(self._page < total_pages)
+        # Tab 标题带数量
+        self._tabs.setTabText(0, f"图片")
+        self._tabs.setTabText(1, f"视频")
+        # 空状态：完全无记录（未筛选也无）时显示提示
+        has_any = len(self._history.all_records()) > 0
         self._empty_hint.setVisible(not has_any)
         self._tabs.setVisible(has_any)
-        # 分类型填充
-        self._grid_image.load(images)
-        self._grid_video.load(videos)
-        # Tab 标题带数量
-        self._tabs.setTabText(0, f"图片 ({len(images)})")
-        self._tabs.setTabText(1, f"视频 ({len(videos)})")
+
+    def refresh(self) -> None:
+        """从 HistoryManager 重新加载（保留当前筛选/页码）。"""
+        self._apply_filter_and_page()
+
+    def _on_filter_changed(self) -> None:
+        """筛选条件变化：重置到第 1 页并重新加载。"""
+        self._page = 1
+        self._apply_filter_and_page()
+
+    def _on_tab_changed(self) -> None:
+        """切换 Tab：重置到第 1 页并重新加载。"""
+        self._page = 1
+        self._apply_filter_and_page()
+
+    def _on_prev_page(self) -> None:
+        if self._page > 1:
+            self._page -= 1
+            self._apply_filter_and_page()
+
+    def _on_next_page(self) -> None:
+        total_pages = max(1, (self._filtered_total + PAGE_SIZE - 1) // PAGE_SIZE)
+        if self._page < total_pages:
+            self._page += 1
+            self._apply_filter_and_page()
 
     def load_thumb(self, record: "HistoryRecord") -> QPixmap | None:
         """加载缩略图为 QPixmap。供 _HistoryGrid 调用。"""

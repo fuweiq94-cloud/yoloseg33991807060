@@ -46,6 +46,16 @@ class AlarmConfig:
     cooldown_seconds: float = 3.0
     clip_pre_seconds: float = 2.0
     clip_post_seconds: float = 2.0
+    # 驻留判定：目标在 ROI 内连续停留 ≥ dwell_seconds 才报警。0 = 关闭（瞬时）。
+    # grace = 离开宽限期（抗检测抖动）。实际判定由 RoiManager.filter_dwell 完成
+    #（需 track_id 才能跨帧计时），这两字段仅作 RoiManager 读取的配置载体。
+    dwell_seconds: float = 0.0
+    dwell_grace: float = 1.0
+    # 报警片段录像开关 + 输出目录。实际录制由 VideoWorker 完成（需回溯触发前的帧，
+    # 只有持有帧流的 worker 能做到）；这两字段仅作 worker 读取的配置载体，
+    # AlarmEngine.trigger 不消费，与 snapshots_dir/logs_dir 同模式。
+    enabled_clip: bool = True
+    clips_dir: str = "data/clips"
     popup: bool = True
     snapshots_dir: str = "data/snapshots"
     logs_dir: str = "data/logs"

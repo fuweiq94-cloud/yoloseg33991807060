@@ -90,6 +90,16 @@ class RoiManager:
     def __init__(self) -> None:
         self._regions: list[RoiRegion] = []
         self._next_id: int = 1
+        # 触发报警的类别白名单。None 或空集 = 所有类别都报警（向后兼容）。
+        # 仅过滤"是否报警"，不影响 ROI 判定/红框高亮/统计计数。
+        self._alarm_classes: set[int] | None = None
+        # 驻留判定：目标在 ROI 内连续停留 ≥ dwell_seconds 才报警。
+        # dwell_seconds=0 = 关闭（瞬时报警，向后兼容）。
+        # grace = 离开后的宽限期（抗检测抖动：漏检 grace 秒内仍算连续）。
+        self._dwell_seconds: float = 0.0
+        self._dwell_grace: float = 1.0
+        # 驻留计时状态：{(track_id, roi_id): {"enter": 首次进入时刻, "last": 最后在场时刻}}
+        self._dwell_state: dict[tuple[int, int], dict[str, float]] = {}
 
     # ---- 增删查 ----
     def add(self, points: list[tuple[float, float]], label: str = "", color: str = "") -> RoiRegion:
@@ -134,6 +144,92 @@ class RoiManager:
 
     def __len__(self) -> int:
         return len(self._regions)
+
+    # ---- 报警类别过滤 ----
+    def set_alarm_classes(self, classes) -> None:
+        """设置触发报警的类别白名单。
+
+        None 或空集 = 所有类别都报警（向后兼容；也防止用户误清空后突然全静默）。
+        仅影响报警判定，不影响 ROI 命中/红框高亮/统计计数。
+        """
+        self._alarm_classes = set(int(c) for c in classes) if classes else None
+
+    @property
+    def alarm_classes(self) -> set[int] | None:
+        """当前报警类别白名单。None = 不过滤（全报警）。"""
+        return set(self._alarm_classes) if self._alarm_classes is not None else None
+
+    # ---- 驻留判定 ----
+    def set_dwell(self, seconds: float, grace: float = 1.0) -> None:
+        """设置驻留阈值（秒）。0 = 关闭（瞬时报警，向后兼容）。
+
+        seconds: 目标在 ROI 内连续停留 ≥ 此值才报警。
+        grace:   离开后的宽限期——漏检 grace 秒内重新出现仍算连续（抗检测抖动）。
+        切换阈值时清空计时状态，避免旧状态干扰。
+        """
+        self._dwell_seconds = max(0.0, float(seconds))
+        self._dwell_grace = max(0.0, float(grace))
+        self._dwell_state.clear()
+
+    def filter_dwell(
+        self,
+        violators: list[tuple[int, int]],
+        track_ids,
+        ts: float,
+    ) -> list[tuple[int, int]]:
+        """从 violators [(box_idx, roi_id)] 中筛出「满足驻留阈值」的目标。
+
+        返回满足驻留的 violators 子集（用于触发报警）。红框高亮/统计仍用原始 violators。
+
+        - dwell_seconds=0：直接返回全部（关闭，向后兼容）。
+        - 无 track_id（track_ids 空/全 -1，如单图）：返回全部（无法判驻留，瞬时报警）。
+        - 每个 (track_id, roi_id)：
+          - 在场：更新 last_seen；首次进入记 enter_ts。
+          - 本帧不在场但 last_seen 在 grace 内：保留计时（宽容漏检）。
+          - 离开超 grace：重置该键。
+          - 累计在场 ts - enter ≥ dwell_seconds：满足，保留。
+        """
+        if self._dwell_seconds <= 0.0:
+            return list(violators)  # 关闭，不过滤
+        # 无有效 track_id：无法判定驻留，退化为瞬时（返回全部）
+        tids = list(track_ids) if track_ids is not None and len(track_ids) else []
+        if not tids or all(int(t) < 0 for t in tids):
+            return list(violators)
+
+        # 本帧在场的 (tid, rid) 集合
+        present: set[tuple[int, int]] = set()
+        for box_idx, roi_id in violators:
+            if box_idx < len(tids):
+                tid = int(tids[box_idx])
+                if tid >= 0:
+                    present.add((tid, roi_id))
+
+        # 更新在场目标的计时
+        for key in present:
+            st = self._dwell_state.get(key)
+            if st is None:
+                self._dwell_state[key] = {"enter": ts, "last": ts}
+            else:
+                st["last"] = ts  # enter 保持首次进入时刻（连续未中断）
+
+        # 清除离开超 grace 的目标（真正离开）
+        expired = [k for k, st in self._dwell_state.items()
+                   if k not in present and (ts - st["last"]) > self._dwell_grace]
+        for k in expired:
+            del self._dwell_state[k]
+
+        # 筛出满足驻留阈值的 violators
+        result = []
+        for box_idx, roi_id in violators:
+            if box_idx < len(tids):
+                tid = int(tids[box_idx])
+                if tid >= 0:
+                    st = self._dwell_state.get((tid, roi_id))
+                    if st is not None and (ts - st["enter"]) >= self._dwell_seconds:
+                        result.append((box_idx, roi_id))
+                        continue
+            # 无 track_id 的框：dwell_seconds>0 时无法判定，不触发（保守：宁可不报）
+        return result
 
     # ---- 判定 ----
     def violators(

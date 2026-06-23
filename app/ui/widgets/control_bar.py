@@ -5,7 +5,7 @@ from enum import Enum
 
 from PyQt5.QtCore import QSize, pyqtSignal
 from PyQt5.QtWidgets import (
-    QWidget, QHBoxLayout, QPushButton, QComboBox, QLabel, QSpinBox, QFileDialog,
+    QWidget, QHBoxLayout, QPushButton, QLabel, QFileDialog,
 )
 
 from app.ui.theme import get_palette
@@ -21,7 +21,7 @@ class SourceType(Enum):
 class ControlBar(QWidget):
     """工具栏控件：源类型切换、源选择、开始/暂停/停止。"""
 
-    start_requested = pyqtSignal(object)   # 发送 (source, SourceType)
+    start_requested = pyqtSignal(object)   # 单源: (source, SourceType)；多源: {"multi": [cam_idx,...]}
     pause_requested = pyqtSignal()
     resume_requested = pyqtSignal()
     stop_requested = pyqtSignal()
@@ -61,12 +61,18 @@ class ControlBar(QWidget):
 
         layout.addWidget(self._sep_label("源:"))
 
-        # 源选择
-        self.cam_combo = QComboBox()
+        # 摄像头源选择：4 个 checkable 按钮（支持单选/多选并发）。
+        # 选 1 个 = 单源（兼容旧路径），选多个 = 多源并发。
+        self._cam_btns: list[QPushButton] = []
         for i in range(4):
-            self.cam_combo.addItem(f"摄像头 {i}", i)
-        self.cam_combo.currentIndexChanged.connect(self._on_cam_changed)
-        layout.addWidget(self.cam_combo)
+            b = QPushButton(f"CAM{i}")
+            b.setCheckable(True)
+            b.setProperty("role", "flat")
+            b.clicked.connect(self._on_cam_btn_changed)
+            self._cam_btns.append(b)
+            layout.addWidget(b)
+        # 默认选中 CAM0（与原行为一致：摄像头 0）
+        self._cam_btns[0].setChecked(True)
 
         self.source_label = QLabel("（请选择）")
         self.source_label.setStyleSheet("color: #9AA0A6;")
@@ -113,10 +119,11 @@ class ControlBar(QWidget):
         ):
             b.setChecked(t == src_type)
         # 显示对应源选择控件
-        self.cam_combo.setVisible(src_type == SourceType.CAMERA)
+        for cb in self._cam_btns:
+            cb.setVisible(src_type == SourceType.CAMERA)
         self.source_label.setVisible(src_type != SourceType.CAMERA)
         if src_type == SourceType.CAMERA:
-            self._current_source = self.cam_combo.currentData()
+            self._sync_current_source()
         else:
             self._current_source = None
             self.source_label.setText("（请选择）")
@@ -140,12 +147,36 @@ class ControlBar(QWidget):
     def _short(path: str, n: int = 40) -> str:
         return path if len(path) <= n else "..." + path[-(n - 3):]
 
-    def _on_cam_changed(self) -> None:
+    def _on_cam_btn_changed(self) -> None:
+        """摄像头按钮勾选变化：同步当前源（单选时是 int，多选时由 _on_start 处理多源）。"""
         if self._current_type == SourceType.CAMERA:
-            self._current_source = self.cam_combo.currentData()
+            self._sync_current_source()
+
+    def _sync_current_source(self) -> None:
+        """根据勾选的摄像头按钮同步 _current_source。
+
+        - 恰好选 1 个：_current_source = 该 index（单源，兼容旧路径）
+        - 选多个：_current_source = 主路 index（_on_start 时改发多源载荷）
+        - 全没选：_current_source = None（禁止开始）
+        """
+        selected = [i for i, b in enumerate(self._cam_btns) if b.isChecked()]
+        self._current_source = selected[0] if selected else None
 
     # ---- 播放控制 ----
     def _on_start(self) -> None:
+        if self._current_type == SourceType.CAMERA:
+            selected = [i for i, b in enumerate(self._cam_btns) if b.isChecked()]
+            if not selected:
+                return
+            self.btn_start.setEnabled(False)
+            self.btn_pause.setEnabled(True)
+            self.btn_stop.setEnabled(True)
+            # 多源（≥2 路）发 {"multi": [...]}；单源发 (source, type) 兼容旧路径
+            if len(selected) >= 2:
+                self.start_requested.emit({"multi": selected})
+            else:
+                self.start_requested.emit((selected[0], self._current_type))
+            return
         if self._current_source is None:
             return
         self.btn_start.setEnabled(False)

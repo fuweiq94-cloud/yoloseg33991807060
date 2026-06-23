@@ -119,6 +119,40 @@ class HistoryManager:
         with self._io_lock:
             return sorted(self._records, key=lambda r: r.timestamp, reverse=True)
 
+    def query(
+        self,
+        type: str | None = None,
+        alarm_only: bool = False,
+        since: float | None = None,
+        keyword: str | None = None,
+    ) -> list[HistoryRecord]:
+        """按条件筛选，返回倒序列表（复用 all_records 的倒序，不重复排序）。
+
+        type:       "image"/"video"/None（None=不限）。
+        alarm_only: 仅 alarms>0 的记录。
+        since:      起始时间戳（含），早于此的被过滤。
+        keyword:    来源名/类别名模糊匹配（大小写不敏感）。None/空=不限。
+        """
+        records = self.all_records()
+        kw = keyword.strip().lower() if keyword else ""
+        result = []
+        for r in records:
+            if type is not None and r.type != type:
+                continue
+            if alarm_only and r.alarms <= 0:
+                continue
+            if since is not None and r.timestamp < since:
+                continue
+            if kw:
+                # 匹配来源名或任一类别名
+                hay = r.source_name.lower()
+                if kw not in hay:
+                    matched_cls = any(kw in str(v).lower() for v in r.class_names.values())
+                    if not matched_cls:
+                        continue
+            result.append(r)
+        return result
+
     def get(self, record_id: str) -> HistoryRecord | None:
         with self._io_lock:
             for r in self._records:

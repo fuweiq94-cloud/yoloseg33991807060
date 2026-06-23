@@ -148,6 +148,38 @@ class StatsPanel(QWidget):
     def mark_dirty(self) -> None:
         self._dirty = True
 
+    # ---- 导出支持：供 StatsPage 取当前图表 widget/数据 ----
+    def current_chart_widget(self) -> QWidget | None:
+        """当前图表的 widget（PlotWidget/GraphicsLayoutWidget），供 grab() 截图导出 PNG。"""
+        return self._current_widget
+
+    def current_chart_data(self) -> tuple[str, list[tuple[str, float]]] | None:
+        """当前图表的数据快照，返回 (类型名, [(标签, 值), ...])。无数据时 None。
+
+        - BAR:   ("类别柱状", [(类名, 数量), ...])
+        - PIE:   ("类别占比", [(类名, 占比0-1), ...])
+        - LINE:  ("目标趋势", [(时间标签, 目标数), ...])
+        - ALARM: ("报警趋势", [(时间标签, 报警数), ...])
+        返回的是缓存的拷贝，所见即所得（与屏幕显示一致）。
+        """
+        if self._chart == self.CHART_BAR:
+            if not self._class_counts:
+                return None
+            return ("类别柱状", [(k, float(v)) for k, v in self._class_counts.items()])
+        if self._chart == self.CHART_PIE:
+            if not self._class_ratio:
+                return None
+            return ("类别占比", [(k, float(v)) for k, v in self._class_ratio.items()])
+        if self._chart == self.CHART_LINE:
+            if not self._time_labels:
+                return None
+            return ("目标趋势", list(zip(self._time_labels, [float(v) for v in self._time_values])))
+        if self._chart == self.CHART_ALARM:
+            if not self._alarm_labels:
+                return None
+            return ("报警趋势", list(zip(self._alarm_labels, [float(v) for v in self._alarm_values])))
+        return None
+
     def _flush(self) -> None:
         if self._dirty:
             self._dirty = False

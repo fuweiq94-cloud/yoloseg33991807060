@@ -68,12 +68,19 @@ class MainWindow(QMainWindow):
         self._cfg = get_config()
         self._project_root = self._resolve_project_root()
         self._roi_manager = RoiManager()
+        # 报警类别过滤：从配置恢复（None = 全报警，向后兼容）
+        self._roi_manager.set_alarm_classes(self._cfg.get("alarm.classes"))
         self._stats = StatsCollector(
             logs_dir=self._abs_path(self._cfg.get("paths.logs_dir", "data/logs")),
         )
         self._detector: Detector | None = None  # 懒加载
         self._alarm: AlarmEngine | None = None
-        self._worker = None  # VideoWorker / ImageWorker
+        self._worker = None  # VideoWorker / ImageWorker / MultiSourceVideoWorker
+        # 多源并发（方案 A）状态：per-source 实例池 + 是否多源模式标记
+        self._multi_mode = False
+        self._multi_roi: list = []      # list[RoiManager]，每路一份
+        self._multi_stats: list = []    # list[StatsCollector]
+        self._multi_alarm: list = []    # list[AlarmEngine | None]
 
         # 类别元数据
         self._classes_meta = load_classes(
@@ -336,6 +343,8 @@ class MainWindow(QMainWindow):
     def _wire_pages(self) -> None:
         # 检测页：类别筛选变化
         self.page_detection.classes_changed.connect(self._on_classes_changed)
+        # 检测页：报警类别过滤（按类过滤报警，不影响检测/红框）
+        self.page_detection.alarm_classes_changed.connect(self._on_alarm_classes_changed)
         # 检测页：视频内联播放控件（与顶部 ControlBar 等效）
         self.page_detection.video_play_toggled.connect(self._on_play_toggled)
         self.page_detection.video_seek_requested.connect(self._on_seek_requested)
@@ -355,6 +364,9 @@ class MainWindow(QMainWindow):
 
         # 设置页：应用
         self.page_settings.settings_applied.connect(self._on_settings_applied)
+
+        # 报警类别勾选从配置恢复（页面控件此时已建好）
+        self.page_detection.set_alarm_classes(self._cfg.get("alarm.classes"))
 
     def _apply_theme_to_pages(self) -> None:
         for page in (self.page_detection, self.page_roi, self.page_stats, self.page_history, self.page_settings):
@@ -661,6 +673,10 @@ class MainWindow(QMainWindow):
             cooldown_seconds=cfg.get("alarm.cooldown_seconds", 3.0),
             clip_pre_seconds=cfg.get("alarm.clip_pre_seconds", 2.0),
             clip_post_seconds=cfg.get("alarm.clip_post_seconds", 2.0),
+            dwell_seconds=cfg.get("alarm.dwell_seconds", 0.0),
+            dwell_grace=cfg.get("alarm.dwell_grace", 1.0),
+            enabled_clip=cfg.get("alarm.enabled_clip", True),
+            clips_dir=self._abs_path(cfg.get("paths.clips_dir", "data/clips")),
             popup=cfg.get("alarm.popup", True),
             snapshots_dir=self._abs_path(cfg.get("paths.snapshots_dir", "data/snapshots")),
             logs_dir=self._abs_path(cfg.get("paths.logs_dir", "data/logs")),
@@ -673,6 +689,11 @@ class MainWindow(QMainWindow):
         self._alarm.set_sound_callback(self._on_alarm_sound)
         self._alarm.set_snapshot_callback(self._on_alarm_snapshot)
         self._alarm.set_log_callback(self._on_alarm_log)
+        # 驻留判定配置同步到 roi_manager（实际判定在 RoiManager.filter_dwell）
+        self._roi_manager.set_dwell(
+            cfg.get("alarm.dwell_seconds", 0.0),
+            cfg.get("alarm.dwell_grace", 1.0),
+        )
 
     # ====================================================================
     # 工具栏信号
@@ -681,6 +702,10 @@ class MainWindow(QMainWindow):
         self.lbl_source.setText(f"源: {src_type.value}")
 
     def _on_start(self, payload) -> None:
+        # 多源并发（摄像头多选）：payload = {"multi": [cam_idx,...]}
+        if isinstance(payload, dict) and "multi" in payload:
+            self._on_start_multi(payload["multi"])
+            return
         source, src_type = payload
         if self._detector is None:
             QMessageBox.information(self, "未就绪", "模型尚未加载完成，请稍候。")
@@ -723,9 +748,18 @@ class MainWindow(QMainWindow):
                 record_path = None
                 if src_type == SourceType.VIDEO:
                     record_path = self._history.new_temp_video_path()
+                # 报警片段录像配置：从 AlarmConfig 取最新值（开关/pre/post/目录）
+                ac = self._alarm._config if self._alarm is not None else None
+                alarm_clip_cfg = {
+                    "enabled": bool(getattr(ac, "enabled_clip", False)),
+                    "pre": float(getattr(ac, "clip_pre_seconds", 0.0)),
+                    "post": float(getattr(ac, "clip_post_seconds", 0.0)),
+                    "clips_dir": str(getattr(ac, "clips_dir", "data/clips")),
+                }
                 self._worker = VideoWorker(
                     source, self._detector, self._roi_manager,
-                    self._stats, self._alarm, record_path=record_path, parent=self,
+                    self._stats, self._alarm, record_path=record_path,
+                    alarm_clip_config=alarm_clip_cfg, parent=self,
                 )
         except Exception as e:
             logger.exception("worker 创建失败")
@@ -737,6 +771,116 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText("检测中")
         self.lbl_source.setText(f"源: {source if not isinstance(source, int) else f'camera{source}'}")
         self._worker.start()
+
+    def _on_start_multi(self, cam_indices: list) -> None:
+        """多摄像头并发启动（方案 A：单 worker 串行推理 + 多路采集）。
+
+        每路独立的 RoiManager/StatsCollector/AlarmEngine，互不干扰。
+        检测页切换为 2x2 网格画布，按 source_id 路由帧。
+        """
+        if self._detector is None:
+            QMessageBox.information(self, "未就绪", "模型尚未加载完成，请稍候。")
+            self.control_bar.on_stopped()
+            return
+        if not cam_indices:
+            QMessageBox.information(self, "未选择源", "请至少选择一个摄像头。")
+            self.control_bar.on_stopped()
+            return
+
+        self._sync_detector_params()
+        self._build_alarm_engine()
+        self._stop_worker()
+
+        # 切换检测页到多源 2x2 网格布局
+        self._multi_mode = True
+        self.page_detection.set_multi_mode(True)
+        self.page_detection.set_video_mode(False)
+        self.page_roi.set_video_mode(False)
+
+        # per-source 实例池：每路独立 roi/stats/alarm（报警类别过滤从配置复制到每路）
+        from app.core.roi import RoiManager
+        from app.core.statistics import StatsCollector
+        from app.core.alarm import AlarmEngine, AlarmConfig
+        alarm_cls = self._roi_manager.alarm_classes
+        dwell_sec = self._cfg.get("alarm.dwell_seconds", 0.0)
+        dwell_grace = self._cfg.get("alarm.dwell_grace", 1.0)
+        self._multi_roi = []
+        self._multi_stats = []
+        self._multi_alarm = []
+        logs_dir = self._abs_path(self._cfg.get("paths.logs_dir", "data/logs"))
+        for _ in cam_indices:
+            rm = RoiManager()
+            rm.set_alarm_classes(alarm_cls)
+            rm.set_dwell(dwell_sec, dwell_grace)
+            self._multi_roi.append(rm)
+            self._multi_stats.append(StatsCollector(logs_dir=logs_dir))
+            # 报警引擎：复用当前 AlarmConfig，独立实例保证冷却 per-source 隔离
+            self._multi_alarm.append(AlarmEngine(AlarmConfig(
+                **{k: v for k, v in vars(self._alarm._config).items()} if self._alarm else {}
+            )))
+
+        self._cur_source_type = SourceType.CAMERA
+        self._cur_source_name = f"多路({len(cam_indices)}个摄像头)"
+        try:
+            from app.workers.multi_source_worker import MultiSourceVideoWorker
+            self._worker = MultiSourceVideoWorker(
+                cam_indices, self._detector,
+                self._multi_roi, self._multi_stats, self._multi_alarm,
+                parent=self,
+            )
+        except Exception as e:
+            logger.exception("多源 worker 创建失败")
+            self.lbl_status.setText(f"启动失败: {e}")
+            self.control_bar.on_stopped()
+            return
+
+        # 多源信号路由（带 source_id）
+        w = self._worker
+        w.frame_ready.connect(self._on_frame_multi)
+        w.details_ready.connect(self._on_details_multi)
+        w.fps_updated.connect(self._on_fps_multi)
+        w.alarm_ready.connect(self._on_alarm_ready)
+        w.error_occurred.connect(self._on_error_multi)
+        w.finished_source.connect(self._on_finished_source_multi)
+        w.all_finished.connect(self._on_finished)
+        self.lbl_status.setText("多路检测中")
+        self.lbl_source.setText(f"源: {self._cur_source_name}")
+        self._worker.start()
+
+    # ---- 多源 worker 信号槽 ----
+    def _on_frame_multi(self, source_id: int, annotated, violator_indices, centers) -> None:
+        """多源帧：按 source_id 路由到检测页对应画布。"""
+        # 该路的 ROI 同步到对应画布
+        rois = [(r.points, r.color) for r in self._multi_roi[source_id].regions]
+        self.page_detection.update_frame_multi(source_id, annotated, violator_indices, centers)
+        # 把 ROI 画到对应画布上（每路独立 ROI）
+        if 0 <= source_id < len(self.page_detection.canvases):
+            self.page_detection.canvases[source_id].set_rois(rois)
+        # 报警状态
+        self._cur_alarm = bool(violator_indices)
+        self._status_dirty = True
+
+    def _on_details_multi(self, source_id: int, details) -> None:
+        """多源详情：仅缓存主路(source_id=0)的详情供面板显示，避免 4 路互相覆盖。"""
+        if source_id == 0:
+            self._cur_details = details
+            self._details_dirty = True
+
+    def _on_fps_multi(self, source_id: int, fps: float) -> None:
+        """多源 FPS：仅显示主路 FPS，避免 4 路状态文字闪烁。"""
+        if source_id == 0:
+            self._cur_fps = fps
+            self._status_dirty = True
+
+    def _on_error_multi(self, source_id: int, msg: str) -> None:
+        logger.error("路 %d 错误: %s", source_id, msg)
+        self.page_detection.mark_source_inactive(source_id)
+        self._show_alarm_msg(f"摄像头{source_id} 错误: {msg}")
+
+    def _on_finished_source_multi(self, source_id: int) -> None:
+        """某路采集结束（摄像头断开）：标记画布为无信号。"""
+        self.page_detection.mark_source_inactive(source_id)
+        logger.info("路 %d 采集结束", source_id)
 
     def _wire_worker(self, worker) -> None:
         # 同一帧广播给检测页与 ROI 页两个画布
@@ -752,6 +896,9 @@ class MainWindow(QMainWindow):
             worker.video_recorded.connect(self._on_video_recorded)
         if hasattr(worker, "progress_updated"):
             worker.progress_updated.connect(self._on_progress)
+        # 报警片段录像：仅 VideoWorker 有此信号（ImageWorker 单图无片段概念）
+        if hasattr(worker, "clip_recorded"):
+            worker.clip_recorded.connect(self._on_clip_recorded)
 
     def _sync_detector_params(self) -> None:
         if self._detector is None:
@@ -827,6 +974,24 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._worker = None
+        # 多源模式：关闭各路报警引擎 + flush 各路统计 + 恢复检测页单源布局
+        if self._multi_mode:
+            for ae in self._multi_alarm:
+                if ae is not None:
+                    try:
+                        ae.shutdown()
+                    except Exception:
+                        pass
+            for st in self._multi_stats:
+                try:
+                    st.flush()
+                except Exception:
+                    pass
+            self._multi_roi = []
+            self._multi_stats = []
+            self._multi_alarm = []
+            self._multi_mode = False
+            self.page_detection.set_multi_mode(False)
         # 停止时把统计缓冲区的剩余采样落盘，避免丢失最近几秒数据
         try:
             self._stats.flush()
@@ -945,6 +1110,24 @@ class MainWindow(QMainWindow):
         self._cur_record = (tmp_path, duration, self._cur_source_name)
         self.control_bar.set_save_enabled(True)
         logger.info("视频录制就绪，可保存: %.1fs", duration)
+
+    def _on_clip_recorded(self, path: str) -> None:
+        """报警片段录像完成：立即归档为历史视频记录（带报警标记）。
+
+        与 _on_save 不同，报警片段是独立事件产物，应即时入历史库，不挂起等待用户保存。
+        归档失败（如文件无效）静默处理，不影响主流程。
+        """
+        try:
+            self._history.add_video(
+                path, self._cur_source_name or "报警片段",
+                alarms=1,
+            )
+            self.page_history.refresh()
+            self.lbl_status.setText("已保存报警片段到历史记录")
+            self._show_alarm_msg("报警片段已自动保存")
+            logger.info("报警片段已归档: %s", path)
+        except Exception:
+            logger.exception("报警片段归档失败: %s", path)
 
     def _on_save(self) -> None:
         """保存当前识别结果到历史记录。"""
@@ -1135,6 +1318,16 @@ class MainWindow(QMainWindow):
         self._cfg.set("detection.classes", ids, autosave=True)
         if self._detector is not None:
             self._detector.set_classes(ids or None)
+
+    def _on_alarm_classes_changed(self, ids: list) -> None:
+        """报警类别过滤：更新 roi_manager 白名单 + 持久化。
+
+        ids 为空时存 None（=全报警，向后兼容；也防止误清空后全静默）。
+        与 _on_classes_changed 区别：那是检测类别（喂给 detector），这是报警类别（喂给 roi_manager）。
+        """
+        ids = [int(i) for i in ids] if ids else None
+        self._roi_manager.set_alarm_classes(ids)
+        self._cfg.set("alarm.classes", ids, autosave=True)
 
     # ====================================================================
     # 状态灯 / 时钟

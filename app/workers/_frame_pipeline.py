@@ -78,11 +78,22 @@ def process_frame(
     # 报警：按 roi 聚合，每个 roi 一次 AlarmEvent
     alarms_this_frame = 0
     fired: list[tuple[int, list[int], list[float]]] = []
+    # 报警类别白名单：None = 不过滤（全报警）。仅过滤"是否报警"，不影响
+    # violator_indices（红框高亮）和 counts（统计）——它们仍含全部进 ROI 的目标。
+    alarm_cls_filter = roi_manager.alarm_classes
     if violators and alarm is not None:
+        # 驻留过滤：取出满足驻留阈值的 violators（track_id 可用时才判驻留；
+        # 无 track_id/驻留关闭时 filter_dwell 返回全部）。红框/统计仍用原始 violators。
+        dwell_passed = roi_manager.filter_dwell(violators, result.track_ids, ts)
         by_roi: dict[int, list[int]] = {}
-        for bi, rid in violators:
+        for bi, rid in dwell_passed:
             by_roi.setdefault(rid, []).append(bi)
         for rid, idxs in by_roi.items():
+            # 按报警类别白名单过滤：只保留启用了报警的类别的框
+            if alarm_cls_filter is not None:
+                idxs = [bi for bi in idxs if int(result.clss[bi]) in alarm_cls_filter]
+            if not idxs:
+                continue  # 该 ROI 没有需要报警的目标，跳过（但仍算 violator 红框高亮）
             cls_ids = [int(result.clss[bi]) for bi in idxs]
             confs = [float(result.confs[bi]) for bi in idxs]
             event = AlarmEvent(

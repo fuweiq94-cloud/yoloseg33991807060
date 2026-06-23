@@ -30,7 +30,11 @@ class ClassFilter(QWidget):
         super().__init__(parent)
         self._meta = classes_meta
         self._checks: dict[int, QCheckBox] = {}
-        self._build(default_selected or [0])
+        # default_selected=None 表示全选（用于"报警类别"等默认全启用场景）。
+        # 显式空列表 [] 退化为 [0]，与原行为一致（仅检测人）。
+        if default_selected is None:
+            default_selected = [int(k) for k in classes_meta.keys()]
+        self._build(default_selected)
 
     def _build(self, default_selected: List[int]) -> None:
         layout = QVBoxLayout(self)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -65,7 +66,6 @@ class _CaptureThread(QThread):
         self._latest: np.ndarray | None = None
         self._ok = False
         # 视频文件模式用有界队列
-        from collections import deque
         self._queue: deque = deque()
         self._cap: cv2.VideoCapture | None = None
         self._source_fps: float = 0.0
@@ -213,6 +213,7 @@ class VideoWorker(QThread):
     video_recorded = pyqtSignal(str, float)
     progress_updated = pyqtSignal(int, int)
     details_ready = pyqtSignal(object)   # 载荷为 FrameDetails，供检测页目标详情面板
+    clip_recorded = pyqtSignal(str)      # 报警片段录像完成，载荷为 mp4 路径
 
     def __init__(
         self,
@@ -223,6 +224,7 @@ class VideoWorker(QThread):
         alarm: AlarmEngine | None = None,
         record_path: str | None = None,
         record_fps: float = 25.0,
+        alarm_clip_config: dict | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -241,6 +243,21 @@ class VideoWorker(QThread):
         self._record_fps = float(record_fps)
         self._writer: cv2.VideoWriter | None = None
         self._record_start_ts: float | None = None
+        # 报警片段录像配置：{enabled, pre, post, clips_dir}。
+        # 录制由本 worker 完成（需回溯触发前的帧，只有持有帧流的 worker 能做到）。
+        cfg = alarm_clip_config or {}
+        self._clip_enabled = bool(cfg.get("enabled", False))
+        self._clip_pre = max(0.0, float(cfg.get("pre", 0.0)))
+        self._clip_post = max(0.0, float(cfg.get("post", 0.0)))
+        self._clips_dir = str(cfg.get("clips_dir", "data/clips"))
+        # 环形帧缓冲：存最近 pre 秒的标注帧（.copy()，避免与 ultralytics 缓冲共享撕裂）。
+        # 容量取 pre 秒帧数，帧率在首帧后才稳定，构造时先用 record_fps 估，run() 里校正。
+        ring_cap = max(1, int(self._clip_pre * self._record_fps)) if self._clip_enabled else 0
+        self._ring: deque = deque(maxlen=ring_cap)
+        # 当前正在录的报警片段状态：writer/剩余 post 帧/文件路径
+        self._clip_writer: cv2.VideoWriter | None = None
+        self._clip_remaining: int = 0
+        self._clip_path: str | None = None
         # 进度：已推理的帧序号。seek 时重置为对应位置，保证进度条与画面一致。
         self._frame_idx: int = 0
         # 待应用的 seek 请求（主循环顶部处理）。仅视频文件源有效。
@@ -397,6 +414,32 @@ class VideoWorker(QThread):
                 if self._writer is not None:
                     self._writer.write(annotated_for_emit)
 
+            # 报警片段录像：环形缓冲 + 触发即录（pre 秒历史 + post 秒后续）。
+            # 仅非 seek 期执行（seek 会让帧时间倒流，污染片段）。
+            if self._clip_enabled and not self._seeking:
+                # 1) 每帧把标注帧压入环形缓冲（.copy()，避免与 ultralytics 缓冲共享撕裂）。
+                #    首帧才知道尺寸/源帧率，此时按真实源帧率校正环形缓冲容量。
+                if self._ring.maxlen == 0 or (
+                    self._capture.source_fps > 0
+                    and self._ring.maxlen != max(1, int(self._clip_pre * self._capture.source_fps))
+                ):
+                    src_fps = self._capture.source_fps or self._record_fps
+                    self._ring = deque(
+                        self._ring,
+                        maxlen=max(1, int(self._clip_pre * src_fps)),
+                    )
+                self._ring.append(annotated_for_emit.copy())
+
+                # 2) 真触发且当前未在录：启动新片段，先把环形缓冲（pre 秒历史）全部写入。
+                if outcome.fired_alarms and self._clip_writer is None:
+                    self._start_alarm_clip(annotated_for_emit)
+                # 3) 正在录：写当前帧并递减剩余帧；归零则关闭片段并通知。
+                if self._clip_writer is not None:
+                    self._clip_writer.write(annotated_for_emit)
+                    self._clip_remaining -= 1
+                    if self._clip_remaining <= 0:
+                        self._finalize_alarm_clip(notify=True)
+
             # 发帧：annotated 必须 copy，否则跨线程与 ultralytics 内部缓冲共享会撕裂。
             # centers 是本次推理新算出的 ndarray，所有权独占，无需 copy。
             self.frame_ready.emit(
@@ -418,7 +461,58 @@ class VideoWorker(QThread):
             if isinstance(self._source, str):
                 self.video_recorded.emit(self._record_path, duration)
 
+        # 收尾：关闭仍在录的报警片段（用户停止或 EOF），但不通知——半截片段不归档
+        if self._clip_writer is not None:
+            self._finalize_alarm_clip(notify=False)
+
         logger.info("VideoWorker 结束")
+
+    # ---- 报警片段录像辅助 ----
+    def _start_alarm_clip(self, frame: np.ndarray) -> None:
+        """开始录一段报警片段：先写入环形缓冲（pre 秒历史），再准备录 post 秒后续。
+
+        frame 仅用于取尺寸建 writer；历史帧来自 self._ring。
+        连续报警（post 期内又触发）不延长——当前已在录时直接忽略（见调用处判空）。
+        """
+        import os
+        from datetime import datetime
+        try:
+            os.makedirs(self._clips_dir, exist_ok=True)
+        except OSError:
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = os.path.join(self._clips_dir, f"alarm_{ts}.mp4")
+        h, w = frame.shape[:2]
+        src_fps = self._capture.source_fps if self._capture else 0.0
+        fps = src_fps if src_fps > 0 else self._record_fps
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(path, fourcc, fps, (w, h))
+        if not writer.isOpened():
+            logger.warning("报警片段 VideoWriter 打开失败: %s", path)
+            return
+        # 先回溯写入环形缓冲的全部历史帧（触发前 pre 秒）
+        for past in self._ring:
+            writer.write(past)
+        self._clip_writer = writer
+        self._clip_path = path
+        self._clip_remaining = max(1, int(self._clip_post * fps))
+        logger.info("开始录报警片段: %s (pre=%d帧, post=%d帧)", path, len(self._ring), self._clip_remaining)
+
+    def _finalize_alarm_clip(self, notify: bool) -> None:
+        """关闭当前报警片段。notify=True（post 秒录满）则 emit 路径供归档；
+        notify=False（被停止中断）则静默丢弃，不归档半截片段。"""
+        if self._clip_writer is None:
+            return
+        self._clip_writer.release()
+        path = self._clip_path
+        self._clip_writer = None
+        self._clip_path = None
+        self._clip_remaining = 0
+        if notify and path:
+            logger.info("报警片段录制完成: %s", path)
+            self.clip_recorded.emit(path)
+        else:
+            logger.info("报警片段被中断，丢弃: %s", path)
 
     # 不实现 __del__：解释器关闭阶段 C++ 对象可能已销毁，
     # __del__ 调用 self.wait() 会抛 RuntimeError（"wrapped C/C++ object has been deleted"）。

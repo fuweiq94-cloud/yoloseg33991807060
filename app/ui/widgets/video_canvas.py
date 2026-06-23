@@ -82,6 +82,19 @@ class VideoCanvas(QLabel):
         self.setText(html)
         self.setStyleSheet(f"background-color: {self._palette.canvas_margin};")
 
+    def show_placeholder_text(self, text: str) -> None:
+        """显示居中占位文字（无插画），用于多源模式未启用/已断开的画布槽。
+
+        清空当前帧，回到纯文字占位态。
+        """
+        self._pixmap = None
+        self.setText(
+            f"<div style='text-align:center;'>"
+            f"<span style='color:{self._palette.fg_sub}; font-size:13px;'>{text}</span></div>"
+        )
+        self.setStyleSheet(f"background-color: {self._palette.canvas_margin};")
+        self.update()
+
     # ---- 公共接口 ----
     def update_frame(self, frame_bgr: np.ndarray) -> None:
         """更新显示帧（BGR ndarray）。

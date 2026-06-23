@@ -48,6 +48,9 @@ class StatsCollector:
         self._csv_buffer: list[_Sample] = []
         self._csv_flush_threshold: int = 60  # 约 2 秒（@30fps）落盘一次
         self._ensure_csv_header()
+        # 启动即从 CSV 读回最近 30 分钟采样，让折线/报警趋势/累计计数不因重启清零。
+        # 读回是按帧累计（CSV 无 track_id，无法去重），deque(maxlen) 自然截断超容量旧数据。
+        self._load_recent_from_csv()
 
     def set_names(self, names: dict[int, str]) -> None:
         with self._lock:
@@ -141,6 +144,65 @@ class StatsCollector:
         # 已被 _flush_csv 批量写入取代，保留空实现避免外部（如有）调用报错。
         # 真正的写入走 record() -> 缓冲 -> _flush_csv()。
         pass
+
+    def _load_recent_from_csv(self, recent_seconds: float = 1800.0) -> None:
+        """从 stats.csv 读回最近 recent_seconds 秒的采样，重建内存状态。
+
+        重建内容（启动即恢复，让重启不丢统计）：
+        - _samples（折线/报警趋势用）：同 timestamp 多行聚合成单 _Sample
+        - _class_total：按帧累计（每行 count 累加，CSV 无 track_id 无法去重）
+        - _alarm_total：各帧 alarms 之和（同帧多行只算一次）
+
+        容错：CSV 损坏/格式错/空文件静默跳过，绝不影响启动。
+        只读 recent_seconds（默认 1800=30 分钟）内，避免内存无界增长。
+        deque(maxlen=54000) 会自然截断超容量的旧采样。
+        _seen_ids 不重建（CSV 无 track_id），新检测的去重照常工作。
+        """
+        if not os.path.isfile(self._csv_path):
+            return
+        import time as _time
+        cutoff = _time.time() - recent_seconds
+        # 按 timestamp 聚合：{ts: {"counts": {cid:n}, "alarms": int}}
+        agg: dict[float, dict] = {}
+        try:
+            with open(self._csv_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)  # 跳过表头
+                for row in reader:
+                    if len(row) < 6:
+                        continue
+                    try:
+                        ts = float(row[0])
+                    except (ValueError, TypeError):
+                        continue
+                    if ts < cutoff:
+                        continue  # 超出近期窗口，跳过
+                    try:
+                        alarms = int(float(row[5]))
+                    except (ValueError, TypeError):
+                        alarms = 0
+                    entry = agg.setdefault(ts, {"counts": {}, "alarms": 0})
+                    entry["alarms"] = alarms  # 同帧各行 alarms 相同，覆盖即可
+                    cid_str = row[2].strip()
+                    if cid_str:
+                        try:
+                            cid = int(float(cid_str))
+                            n = int(float(row[4]))
+                        except (ValueError, TypeError):
+                            continue
+                        entry["counts"][cid] = entry["counts"].get(cid, 0) + n
+        except OSError:
+            return
+        # 按时间顺序重建内存状态
+        with self._lock:
+            for ts in sorted(agg.keys()):
+                e = agg[ts]
+                self._samples.append(_Sample(timestamp=ts, counts=e["counts"], alarms=e["alarms"]))
+                # 按帧累计 _class_total（无 track_id 去重）
+                for cid, n in e["counts"].items():
+                    self._class_total[cid] += n
+                self._alarm_total += e["alarms"]
+        # deque(maxlen) 自动截断超容量的最旧采样（_samples），无需手动处理
 
     # ---- 查询 ----
     def class_counts(self) -> dict[str, int]:

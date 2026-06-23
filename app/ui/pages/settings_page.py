@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QLabel, QPushButton, QScrollArea, QFrame, QGroupBox,
     QDoubleSpinBox, QSpinBox, QComboBox, QCheckBox, QLineEdit,
-    QFileDialog,
+    QFileDialog, QMessageBox,
 )
 
 from app.core.config_manager import ConfigManager
@@ -34,6 +34,14 @@ class SettingsPage(BasePage):
         # 顶部操作行
         bar = QHBoxLayout()
         bar.addStretch(1)
+        self.btn_export = QPushButton("导出")
+        self.btn_export.setProperty("role", "flat")
+        self.btn_export.setIcon(load_svg_icon("export", self.palette.fg_main, 16))
+        self.btn_export.clicked.connect(self._export_config)
+        self.btn_import = QPushButton("导入")
+        self.btn_import.setProperty("role", "flat")
+        self.btn_import.setIcon(load_svg_icon("import", self.palette.fg_main, 16))
+        self.btn_import.clicked.connect(self._import_config)
         self.btn_reload = QPushButton("重新载入")
         self.btn_reload.setProperty("role", "flat")
         self.btn_reload.setIcon(load_svg_icon("refresh", self.palette.fg_main, 16))
@@ -45,6 +53,8 @@ class SettingsPage(BasePage):
         self.btn_apply = QPushButton("应用")
         self.btn_apply.setIcon(load_svg_icon("check", "#FFFFFF", 16))
         self.btn_apply.clicked.connect(self._apply)
+        bar.addWidget(self.btn_export)
+        bar.addWidget(self.btn_import)
         bar.addWidget(self.btn_reload)
         bar.addWidget(self.btn_reset)
         bar.addWidget(self.btn_apply)
@@ -136,7 +146,7 @@ class SettingsPage(BasePage):
 
         self.alm_visual = QCheckBox("界面高亮 + 弹窗")
         self.alm_sound = QCheckBox("声音")
-        self.alm_snapshot = QCheckBox("截图 / 录像")
+        self.alm_snapshot = QCheckBox("截图保存")
         self.alm_log = QCheckBox("日志记录")
         f.addWidget(self.alm_visual, row, 1)
         f.addWidget(self.alm_sound, row, 2)
@@ -146,7 +156,9 @@ class SettingsPage(BasePage):
         row += 1
 
         self.alm_popup = QCheckBox("报警时弹窗提示")
+        self.alm_clip = QCheckBox("报警片段录像")
         f.addWidget(self.alm_popup, row, 1)
+        f.addWidget(self.alm_clip, row, 2)
         row += 1
 
         f.addWidget(QLabel("声音文件"), row, 0)
@@ -165,6 +177,15 @@ class SettingsPage(BasePage):
         self.alm_cooldown.setSingleStep(0.5)
         self.alm_cooldown.setDecimals(1)
         f.addWidget(self.alm_cooldown, row, 1)
+        row += 1
+
+        f.addWidget(QLabel("驻留时间 (秒)"), row, 0)
+        self.alm_dwell = QDoubleSpinBox()
+        self.alm_dwell.setRange(0.0, 300.0)
+        self.alm_dwell.setSingleStep(0.5)
+        self.alm_dwell.setDecimals(1)
+        self.alm_dwell.setToolTip("目标在 ROI 内连续停留 ≥ 此值才报警（0=关闭，进 ROI 即报）。抗误报。")
+        f.addWidget(self.alm_dwell, row, 1)
         row += 1
 
         f.addWidget(QLabel("录像前录 (秒)"), row, 0)
@@ -278,8 +299,10 @@ class SettingsPage(BasePage):
         self.alm_snapshot.setChecked(bool(cfg.get("alarm.enabled_snapshot", True)))
         self.alm_log.setChecked(bool(cfg.get("alarm.enabled_log", True)))
         self.alm_popup.setChecked(bool(cfg.get("alarm.popup", True)))
+        self.alm_clip.setChecked(bool(cfg.get("alarm.enabled_clip", True)))
         self.alm_sound_file.setText(cfg.get("alarm.sound_file", ""))
         self.alm_cooldown.setValue(cfg.get("alarm.cooldown_seconds", 3.0))
+        self.alm_dwell.setValue(cfg.get("alarm.dwell_seconds", 0.0))
         self.alm_pre.setValue(cfg.get("alarm.clip_pre_seconds", 2.0))
         self.alm_post.setValue(cfg.get("alarm.clip_post_seconds", 2.0))
 
@@ -311,8 +334,10 @@ class SettingsPage(BasePage):
         cfg.set("alarm.enabled_snapshot", self.alm_snapshot.isChecked())
         cfg.set("alarm.enabled_log", self.alm_log.isChecked())
         cfg.set("alarm.popup", self.alm_popup.isChecked())
+        cfg.set("alarm.enabled_clip", self.alm_clip.isChecked())
         cfg.set("alarm.sound_file", self.alm_sound_file.text().strip())
         cfg.set("alarm.cooldown_seconds", self.alm_cooldown.value())
+        cfg.set("alarm.dwell_seconds", self.alm_dwell.value())
         cfg.set("alarm.clip_pre_seconds", self.alm_pre.value())
         cfg.set("alarm.clip_post_seconds", self.alm_post.value())
 
@@ -331,3 +356,37 @@ class SettingsPage(BasePage):
         self._cfg.reset_defaults(autosave=True)
         self._load_values()
         self.settings_applied.emit()
+
+    def _export_config(self) -> None:
+        """导出当前配置全量为 JSON 文件。"""
+        path, _ = QFileDialog.getSaveFileName(self, "导出配置", "config_export.json", "JSON (*.json)")
+        if not path:
+            return
+        if self._cfg.export_to_file(path):
+            QMessageBox.information(self, "导出成功", f"配置已导出到：\n{path}")
+        else:
+            QMessageBox.warning(self, "导出失败", "写入文件失败，请检查路径权限。")
+
+    def _import_config(self) -> None:
+        """从 JSON 文件导入配置。
+
+        导入时校验：非法字段用默认值静默替换，并提示哪些被重置。
+        成功后刷新表单 + emit settings_applied 触发热重载。
+        """
+        path, _ = QFileDialog.getOpenFileName(self, "导入配置", "", "JSON (*.json)")
+        if not path:
+            return
+        ok, reset_keys = self._cfg.import_from_file(path)
+        if not ok:
+            QMessageBox.warning(self, "导入失败", "无法读取配置文件（文件不存在或不是合法 JSON）。")
+            return
+        # 刷新表单 + 热重载
+        self._load_values()
+        self.settings_applied.emit()
+        if reset_keys:
+            QMessageBox.warning(
+                self, "导入完成（含校正）",
+                "配置已导入，以下字段值非法，已恢复默认：\n" + "\n".join(reset_keys),
+            )
+        else:
+            QMessageBox.information(self, "导入成功", "配置已导入并应用。")

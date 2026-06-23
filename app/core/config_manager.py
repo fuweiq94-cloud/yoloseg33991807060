@@ -28,10 +28,18 @@ DEFAULT_CONFIG: dict = {
         "enabled_sound": True,
         "enabled_snapshot": True,
         "enabled_log": True,
+        "enabled_clip": True,
         "sound_file": "assets/sounds/alarm.wav",
         "cooldown_seconds": 3.0,
         "clip_pre_seconds": 2.0,
         "clip_post_seconds": 2.0,
+        # 驻留判定：目标在 ROI 内连续停留 ≥ dwell_seconds 才报警。0 = 关闭（瞬时）。
+        # dwell_grace = 离开宽限期（抗检测抖动）。
+        "dwell_seconds": 0.0,
+        "dwell_grace": 1.0,
+        # 触发报警的类别白名单。null = 所有类别都报警（向后兼容）。
+        # 与 detection.classes（检测类别）区分：这是控制"哪些类别进 ROI 才报警"。
+        "classes": None,
         "popup": True,
     },
     "roi": {
@@ -169,6 +177,143 @@ class ConfigManager:
             except Exception:
                 # 监听器异常不影响配置流程
                 pass
+
+    # ---- 导入 / 导出 / 校验 ----
+    def export_to_file(self, path: str) -> bool:
+        """导出当前配置全量到指定 JSON 文件。返回是否成功。"""
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.as_dict(), f, ensure_ascii=False, indent=2)
+            return True
+        except OSError:
+            return False
+
+    def import_from_file(self, path: str) -> tuple[bool, list[str]]:
+        """从 JSON 文件导入配置。
+
+        流程：读文件 → JSON 解析 → 逐字段校验（非法值用默认替换）→ 深合并 →
+        save() → 通知监听器('*')。
+        返回 (是否成功, 被重置的字段 dotted_key 列表)。
+        成功但无重置字段时第二项为空列表。
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return False, []
+        if not isinstance(data, dict):
+            return False, []
+        # 先校验：非法字段替换为默认 + 记录被重置路径
+        validated, reset_keys = self._validate_config(data)
+        # 与默认值深合并（保证缺字段补默认），再覆盖校验后的值
+        merged = _deep_merge(DEFAULT_CONFIG, validated)
+        with self._io_lock:
+            self._data = merged
+        self.save()
+        self._notify("*")
+        return True, reset_keys
+
+    @staticmethod
+    def _validate_config(data: dict) -> tuple[dict, list[str]]:
+        """校验配置 dict，返回 (校正后的dict, 被重置字段路径列表)。
+
+        校验基于 _FIELD_RULES 规则表（dotted_key → 校验函数）。
+        非法字段：用 DEFAULT_CONFIG 对应值替换 + 记入 reset_keys。
+        缺失字段不报错（由后续深合并补默认）。
+        """
+        result = copy.deepcopy(data)
+        reset_keys: list[str] = []
+        for dotted, rule in _FIELD_RULES.items():
+            # 取当前值（不存在则跳过，交给深合并补默认）
+            parts = dotted.split(".")
+            node: Any = result
+            present = True
+            for p in parts[:-1]:
+                if not isinstance(node, dict) or p not in node:
+                    present = False
+                    break
+                node = node[p]
+            if not present or not isinstance(node, dict) or parts[-1] not in node:
+                continue
+            value = node[parts[-1]]
+            if not rule(value):
+                # 非法：用默认值替换
+                default_node: Any = DEFAULT_CONFIG
+                for p in parts:
+                    default_node = default_node[p]
+                node[parts[-1]] = copy.deepcopy(default_node)
+                reset_keys.append(dotted)
+        return result, reset_keys
+
+
+# ---- 校验规则表 ----
+# dotted_key -> 校验函数（返回 True=合法）。
+# 覆盖有明确类型/范围约束的字段；纯路径字符串只校验非空+是 str。
+def _is_bool(v: Any) -> bool:
+    return isinstance(v, bool)
+
+
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _is_str(v: Any) -> bool:
+    return isinstance(v, str)
+
+
+def _is_color(v: Any) -> bool:
+    """合法 #RRGGBB 颜色。"""
+    if not isinstance(v, str) or not v.startswith("#"):
+        return False
+    h = v[1:]
+    return len(h) == 6 and all(c in "0123456789abcdefABCDEF" for c in h)
+
+
+def _is_int_list_or_none(v: Any) -> bool:
+    """检测/报警类别：None 或 int 列表。"""
+    return v is None or (isinstance(v, list) and all(isinstance(x, int) for x in v))
+
+
+_FIELD_RULES: dict[str, Callable[[Any], bool]] = {
+    # 检测
+    "detection.model_path": lambda v: isinstance(v, str) and v.strip(),
+    "detection.conf": lambda v: _is_number(v) and 0.0 <= v <= 1.0,
+    "detection.iou": lambda v: _is_number(v) and 0.0 <= v <= 1.0,
+    "detection.imgsz": lambda v: _is_number(v) and 320 <= v <= 1280,
+    "detection.classes": _is_int_list_or_none,
+    "detection.device": lambda v: v in ("cpu", "cuda:0", "cuda:1"),
+    "detection.show_masks": _is_bool,
+    "detection.show_boxes": _is_bool,
+    "detection.show_labels": _is_bool,
+    # 报警
+    "alarm.enabled_visual": _is_bool,
+    "alarm.enabled_sound": _is_bool,
+    "alarm.enabled_snapshot": _is_bool,
+    "alarm.enabled_log": _is_bool,
+    "alarm.enabled_clip": _is_bool,
+    "alarm.popup": _is_bool,
+    "alarm.cooldown_seconds": lambda v: _is_number(v) and v >= 0.0,
+    "alarm.clip_pre_seconds": lambda v: _is_number(v) and 0.0 <= v <= 60.0,
+    "alarm.clip_post_seconds": lambda v: _is_number(v) and 0.0 <= v <= 60.0,
+    "alarm.dwell_seconds": lambda v: _is_number(v) and 0.0 <= v <= 300.0,
+    "alarm.dwell_grace": lambda v: _is_number(v) and 0.0 <= v <= 60.0,
+    "alarm.classes": _is_int_list_or_none,
+    "alarm.sound_file": _is_str,
+    # ROI
+    "roi.line_color": _is_color,
+    "roi.fill_alpha": lambda v: _is_number(v) and 0 <= v <= 255,
+    "roi.line_width": lambda v: _is_number(v) and v >= 0,
+    # 外观
+    "appearance.theme": lambda v: v in ("dark", "light"),
+    "appearance.font_size": lambda v: _is_number(v) and 10 <= v <= 20,
+    "appearance.primary_color": _is_color,
+    # 路径（仅校验是字符串）
+    "paths.snapshots_dir": _is_str,
+    "paths.clips_dir": _is_str,
+    "paths.logs_dir": _is_str,
+    "paths.history_dir": _is_str,
+}
 
 
 def get_config(config_path: str | None = None) -> ConfigManager:
