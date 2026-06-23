@@ -112,6 +112,18 @@ class RoiManager:
                 return True
         return False
 
+    def set_color(self, roi_id: int, color: str) -> bool:
+        """修改指定 ROI 的颜色（hex，如 "#ef4444"）。
+
+        RoiRegion 是普通 dataclass，直接赋值 color 即可，无需重建 polygon。
+        返回是否找到并修改成功。
+        """
+        for r in self._regions:
+            if r.roi_id == roi_id:
+                r.color = color
+                return True
+        return False
+
     def clear(self) -> None:
         self._regions.clear()
         self._next_id = 1

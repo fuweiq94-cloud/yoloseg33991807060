@@ -12,6 +12,8 @@ import numpy as np
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QSplitter, QLabel, QFrame,
+    QTableWidget, QTableWidgetItem, QHeaderView,
+    QAbstractItemView,
 )
 
 from app.ui.pages.base_page import BasePage
@@ -62,9 +64,13 @@ class DetectionPage(BasePage):
         # 右侧侧栏：类别筛选 + 状态条
         sidebar = self._build_sidebar()
         main.addWidget(sidebar)
-        main.setStretchFactor(0, 4)
-        main.setStretchFactor(1, 1)
-        main.setSizes([900, 280])
+        # 第三段：目标详情面板（逐类别计数 + 目标清单）
+        details = self._build_details_panel()
+        main.addWidget(details)
+        main.setStretchFactor(0, 4)   # 画布
+        main.setStretchFactor(1, 1)   # 侧栏
+        main.setStretchFactor(2, 1)   # 详情
+        main.setSizes([820, 260, 240])
         self._root_layout.addWidget(main, 1)
 
     def _build_sidebar(self) -> QWidget:
@@ -102,6 +108,44 @@ class DetectionPage(BasePage):
         v.addStretch(1)
         return panel
 
+    def _build_details_panel(self) -> QWidget:
+        """目标详情面板：顶部逐类别计数汇总 + 下方目标清单（序号/ID/类别/置信度）。
+
+        数据由 MainWindow.update_details 1Hz 推送（每帧重建表格对 GUI 太重）。
+        """
+        panel = QFrame()
+        panel.setMaximumWidth(360)
+        panel.setMinimumWidth(200)
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(8)
+
+        title = QLabel("目标详情")
+        title.setProperty("role", "title")
+        v.addWidget(title)
+
+        # 逐类别计数汇总（内联文本，无目标时显示「无目标」）
+        self.lbl_counts = QLabel("无目标")
+        self.lbl_counts.setProperty("role", "sub")
+        self.lbl_counts.setWordWrap(True)
+        v.addWidget(self.lbl_counts)
+
+        # 目标清单表格：序号 / 跟踪ID / 类别 / 置信度
+        self.tbl_targets = QTableWidget(0, 4)
+        self.tbl_targets.setHorizontalHeaderLabels(["序号", "ID", "类别", "置信度"])
+        self.tbl_targets.verticalHeader().setVisible(False)          # 隐藏行号
+        self.tbl_targets.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl_targets.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tbl_targets.setFocusPolicy(Qt.NoFocus)                  # 不抢画布焦点
+        hdr = self.tbl_targets.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        v.addWidget(self.tbl_targets, 1)
+
+        return panel
+
     def _apply_palette(self) -> None:
         self.canvas.set_palette(self.palette)
         self._set_alarm_lamp(self._alarm_on if hasattr(self, "_alarm_on") else False)
@@ -137,6 +181,40 @@ class DetectionPage(BasePage):
         self.lbl_objs.setText(f"目标 {objs}")
         self._alarm_on = alarm
         self._set_alarm_lamp(alarm)
+
+    def update_details(self, details) -> None:
+        """刷新目标详情面板。details 为 FrameDetails 或 None。
+
+        由 MainWindow 1Hz 节流调用。无目标/停止时清空表格、汇总显示「无目标」。
+        表格不排序，保持与画布检测框同序，便于对照。
+        """
+        targets = getattr(details, "targets", []) if details is not None else []
+        counts = getattr(details, "counts", {}) if details is not None else {}
+
+        # 逐类别计数汇总：如「人 3 · 车 2」，按数量降序
+        if counts:
+            parts = [f"{name} {n}" for name, n in
+                     sorted(counts.items(), key=lambda kv: kv[1], reverse=True)]
+            self.lbl_counts.setText(" · ".join(parts))
+        else:
+            self.lbl_counts.setText("无目标")
+
+        # 目标清单：行数=目标数，逐行填 [序号, ID, 类别, 置信度]
+        self.tbl_targets.setRowCount(len(targets))
+        for row, t in enumerate(targets):
+            # ID：图片源（track_id<0）显示「-」
+            tid = str(t.track_id) if t.track_id >= 0 else "-"
+            self._set_cell(row, 0, str(row + 1))
+            self._set_cell(row, 1, tid)
+            self._set_cell(row, 2, t.cls_name)
+            self._set_cell(row, 3, f"{t.conf:.2f}")
+
+    def _set_cell(self, row: int, col: int, text: str) -> None:
+        """填一格并右对齐数字列（序号/ID/置信度），类别列左对齐。"""
+        item = QTableWidgetItem(text)
+        if col != 2:  # 类别列(col=2)默认左对齐，其余右对齐
+            item.setTextAlignment(Qt.AlignVCenter | Qt.AlignRight)
+        self.tbl_targets.setItem(row, col, item)
 
     def _set_alarm_lamp(self, on: bool) -> None:
         color = self.palette.alarm if on else self.palette.fg_sub

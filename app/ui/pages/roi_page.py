@@ -27,6 +27,7 @@ class RoiPage(BasePage):
     new_roi_requested = pyqtSignal()
     clear_roi_requested = pyqtSignal()
     roi_created = pyqtSignal(list)        # 画布点选闭合 -> 透传顶点（帧像素坐标）
+    roi_color_change_requested = pyqtSignal(int, str)  # 双击列表项改色 -> (roi_id, hex)
     import_requested = pyqtSignal()
     export_requested = pyqtSignal()
     # 视频内联播放控件信号（透传给 MainWindow，与检测页一致）
@@ -34,6 +35,7 @@ class RoiPage(BasePage):
     video_seek_requested = pyqtSignal(int)
 
     def _build_content(self) -> None:
+        self._color_by_id: dict[int, str] = {}
         tip = QLabel("点击「新建多边形」后，在画面上单击添加顶点，双击或回车闭合，ESC 取消。")
         tip.setProperty("role", "sub")
         tip.setWordWrap(True)
@@ -104,7 +106,12 @@ class RoiPage(BasePage):
         v.addLayout(row2)
 
         v.addWidget(QLabel("已建区域"))
+        hint = QLabel("提示：双击任一区域，在弹出的取色器中自选颜色")
+        hint.setProperty("role", "sub")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
         self.roi_list = QListWidget()
+        self.roi_list.itemDoubleClicked.connect(self._on_item_double_clicked)
         v.addWidget(self.roi_list, 1)
 
         return panel
@@ -145,16 +152,33 @@ class RoiPage(BasePage):
     def set_rois(self, rois) -> None:
         self.canvas.set_rois(rois)
 
+    def _on_item_double_clicked(self, item) -> None:
+        """双击列表项：弹出取色器修改该 ROI 颜色，结果通过信号回传 MainWindow。
+
+        取色器以该区域当前色作为初始值；用户取消（颜色无效）时不做任何改动。
+        """
+        from PyQt5.QtGui import QColor
+        from PyQt5.QtWidgets import QColorDialog
+        roi_id = item.data(Qt.UserRole)
+        if not isinstance(roi_id, int):
+            return
+        initial = self._color_by_id.get(roi_id, "#3b82f6")
+        color = QColorDialog.getColor(QColor(initial), self, "选择 ROI 颜色")
+        if color.isValid():
+            self.roi_color_change_requested.emit(roi_id, color.name())
+
     def refresh_roi_list(self, regions) -> None:
         """regions: list[RoiRegion]。每项显示颜色块 + 标签 + 面积。"""
-        from PyQt5.QtGui import QPixmap, QPainter, QColor
+        from PyQt5.QtGui import QPixmap, QPainter, QColor, QIcon
         from PyQt5.QtCore import Qt, QSize
         from PyQt5.QtWidgets import QListWidgetItem
         self.roi_list.clear()
         self.roi_list.setIconSize(QSize(14, 14))
+        self._color_by_id.clear()
         for r in regions:
             # 颜色块图标
             color = r.color or "#3b82f6"
+            self._color_by_id[r.roi_id] = color
             pm = QPixmap(14, 14)
             pm.fill(Qt.transparent)
             p = QPainter(pm)
@@ -167,7 +191,11 @@ class RoiPage(BasePage):
             area = getattr(r, "area", 0.0)
             area_str = self._fmt_area(area)
             item = QListWidgetItem(f"{r.label}    {len(r.points)} 点    面积 {area_str}")
-            item.setIcon(QPixmap(pm))
+            item.setIcon(QIcon(pm))
+            # 存稳定的 roi_id：行序会随增删变化，改色时按 roi_id 定位
+            item.setData(Qt.UserRole, r.roi_id)
+            # 悬停提示：告诉用户双击即可改色
+            item.setToolTip(f"{r.label}\n双击修改颜色")
             self.roi_list.addItem(item)
 
     @staticmethod

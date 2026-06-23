@@ -60,6 +60,9 @@ class VideoCanvas(QLabel):
 
     def set_palette(self, palette) -> None:
         self._palette = palette
+        # 边距色随主题刷新：占位态用内联 stylesheet，运行期由全局 QSS 控制，
+        # 此处统一重设内联 stylesheet 确保两种状态都即时跟随主题。
+        self.setStyleSheet(f"background-color: {palette.canvas_margin};")
         self.update()
 
     # ---- 占位提示 ----
@@ -77,7 +80,7 @@ class VideoCanvas(QLabel):
             f"请选择数据源并开始检测</span></div>"
         )
         self.setText(html)
-        self.setStyleSheet(f"background-color: {self._palette.canvas};")
+        self.setStyleSheet(f"background-color: {self._palette.canvas_margin};")
 
     # ---- 公共接口 ----
     def update_frame(self, frame_bgr: np.ndarray) -> None:

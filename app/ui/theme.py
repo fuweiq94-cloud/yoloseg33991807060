@@ -25,7 +25,8 @@ class Palette:
     fg_main: str        # 主文字
     fg_sub: str         # 次文字
     border: str
-    canvas: str         # 画布背景（纯黑突出视频）
+    canvas: str         # 画布背景（纯黑突出视频/图像）
+    canvas_margin: str  # 视频画布等比缩放后的边距色（融于窗口，避免黑边突兀）
 
     def rgba(self, hex_color: str, alpha: int = 255) -> str:
         """hex(#RRGGBB) 转 rgba 字符串。"""
@@ -48,6 +49,7 @@ DARK = Palette(
     fg_sub="#9AA0A6",
     border="#3C4043",
     canvas="#000000",
+    canvas_margin="#1E1F22",
 )
 
 LIGHT = Palette(
@@ -64,6 +66,7 @@ LIGHT = Palette(
     fg_sub="#5F6368",
     border="#DADCE0",
     canvas="#000000",
+    canvas_margin="#F8F9FA",
 )
 
 PALETTES = {"dark": DARK, "light": LIGHT}
@@ -239,8 +242,8 @@ def build_qss(p: Palette, font_size: int = 13) -> str:
     QSlider::handle:horizontal {{
         background: {p.primary}; width: 14px; margin: -6px 0; border-radius: 7px;
     }}
-    /* 画布 */
-    QLabel#VideoCanvas {{ background-color: {p.canvas}; }}
+    /* 画布：等比缩放后的边距用主题色，避免纯黑边距突兀 */
+    QLabel#VideoCanvas {{ background-color: {p.canvas_margin}; }}
     """
 
 

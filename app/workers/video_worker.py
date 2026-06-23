@@ -212,6 +212,7 @@ class VideoWorker(QThread):
     finished_source = pyqtSignal()
     video_recorded = pyqtSignal(str, float)
     progress_updated = pyqtSignal(int, int)
+    details_ready = pyqtSignal(object)   # 载荷为 FrameDetails，供检测页目标详情面板
 
     def __init__(
         self,
@@ -401,6 +402,8 @@ class VideoWorker(QThread):
             self.frame_ready.emit(
                 annotated_for_emit.copy(), outcome.violator_indices, outcome.centers,
             )
+            # 目标详情（供检测页面板，1Hz 节流消费）
+            self.details_ready.emit(outcome.details)
 
         # 收尾：停采集线程
         self._capture.stop()

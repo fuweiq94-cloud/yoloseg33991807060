@@ -23,6 +23,7 @@ class ImageWorker(QThread):
     alarm_ready = pyqtSignal(int, list, list)
     error_occurred = pyqtSignal(str)
     finished_source = pyqtSignal()
+    details_ready = pyqtSignal(object)   # 载荷为 FrameDetails，供检测页目标详情面板
 
     def __init__(
         self,
@@ -61,4 +62,5 @@ class ImageWorker(QThread):
         self.stats_ready.emit({"counts": outcome.counts, "alarms": outcome.alarms_this_frame})
 
         self.frame_ready.emit(result.annotated, outcome.violator_indices, outcome.centers)
+        self.details_ready.emit(outcome.details)
         self.finished_source.emit()

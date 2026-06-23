@@ -119,6 +119,9 @@ class MainWindow(QMainWindow):
         self._cur_alarm = False
         # 最近一帧缓存：ROI 页按需显示时补帧用（避免给隐藏画布每帧做昂贵转换）
         self._last_frame: tuple | None = None  # (annotated, violator_indices, centers)
+        # 最近一帧目标详情缓存：供检测页目标详情面板，1Hz 节流推送（每帧刷新表格太重）
+        self._cur_details = None
+        self._details_dirty = False
 
         # 历史记录管理
         from app.core.history import HistoryManager
@@ -339,6 +342,7 @@ class MainWindow(QMainWindow):
 
         # ROI 页：用户操作
         self.page_roi.roi_created.connect(self._on_roi_created)
+        self.page_roi.roi_color_change_requested.connect(self._on_roi_color_changed)
         self.page_roi.clear_roi_requested.connect(self._clear_roi)
         self.page_roi.import_requested.connect(self._import_roi)
         self.page_roi.export_requested.connect(self._export_roi)
@@ -737,6 +741,7 @@ class MainWindow(QMainWindow):
     def _wire_worker(self, worker) -> None:
         # 同一帧广播给检测页与 ROI 页两个画布
         worker.frame_ready.connect(self._on_frame)
+        worker.details_ready.connect(self._on_details)
         worker.stats_ready.connect(self._on_stats)
         worker.alarm_ready.connect(self._on_alarm_ready)
         worker.error_occurred.connect(self._on_error)
@@ -827,6 +832,10 @@ class MainWindow(QMainWindow):
             self._stats.flush()
         except Exception:
             pass
+        # 清空目标详情面板，避免切换源/停止后残留上一源的旧清单
+        self._cur_details = None
+        self._details_dirty = False
+        self.page_detection.update_details(None)
 
     # ====================================================================
     # Worker 信号 -> 路由到页面
@@ -869,6 +878,14 @@ class MainWindow(QMainWindow):
                 return lp
         return None
 
+    def _on_details(self, details) -> None:
+        """worker 推来的目标详情：仅缓存 + 标脏，真正的表格刷新交给 1Hz 定时器。
+
+        每帧重建 QTableWidget 是重活（行多时尤甚），与 status 文字同理收敛到节流。
+        """
+        self._cur_details = details
+        self._details_dirty = True
+
     def _on_stats(self, data: dict) -> None:
         # 节流：每帧到达只标记脏数据，真正的全量查询交给 1Hz 的 _stats_timer。
         # 避免 _samples 无界增长时每帧遍历几万条采样拖垮主线程。
@@ -892,6 +909,11 @@ class MainWindow(QMainWindow):
             self.page_detection.update_status(
                 self._cur_fps, self._cur_objs, self._cur_alarm,
             )
+        # 目标详情面板：1Hz 节流刷新（仅检测页可见时有意义，但 update_details 本身很轻，
+        # 隐藏页不会重绘表格，这里统一推一次无妨）
+        if self._details_dirty:
+            self._details_dirty = False
+            self.page_detection.update_details(self._cur_details)
 
     def _on_alarm_ready(self, roi_id: int, cls_ids: list, confs: list) -> None:
         self._cur_alarm = True
@@ -1055,6 +1077,13 @@ class MainWindow(QMainWindow):
         region = self._roi_manager.add([tuple(p) for p in frame_pts])
         self._refresh_roi_views()
         self.lbl_status.setText(f"已添加 {region.label}")
+
+    def _on_roi_color_changed(self, roi_id: int, color: str) -> None:
+        """ROI 页列表双击改色：更新数据并同步两个画布 + 列表色块。"""
+        if not self._roi_manager.set_color(roi_id, color):
+            return
+        self._refresh_roi_views()
+        self.lbl_status.setText(f"已修改 ROI{roi_id} 颜色")
 
     def _clear_roi(self) -> None:
         self._roi_manager.clear()

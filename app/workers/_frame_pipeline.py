@@ -18,6 +18,27 @@ from app.core.statistics import StatsCollector
 
 
 @dataclass
+class TargetInfo:
+    """单个检测目标的详情（供检测页目标清单面板显示）。
+
+    与 DetectionResult.boxes 同序，便于对照画布上的检测框。
+    """
+
+    track_id: int     # 跟踪 ID（视频源有；图片源为 -1）
+    cls_id: int
+    cls_name: str
+    conf: float
+
+
+@dataclass
+class FrameDetails:
+    """单帧的目标详情汇总（供检测页目标详情面板显示，1Hz 节流刷新）。"""
+
+    targets: list[TargetInfo]   # 逐目标，与 boxes 同序
+    counts: dict[str, int]      # {类名: 数} 逐类别瞬时计数
+
+
+@dataclass
 class FrameOutcome:
     """单帧处理结果。worker 据此发射对应信号。"""
 
@@ -27,6 +48,7 @@ class FrameOutcome:
     alarms_this_frame: int           # 实际触发（未被冷却合并）的报警数
     fired_alarms: list[tuple[int, list[int], list[float]]]
     # 已触发的报警 [(roi_id, cls_ids, confs), ...]，按触发顺序，供 worker 发 alarm_ready
+    details: FrameDetails            # 目标详情（供检测页面板显示）
 
 
 def process_frame(
@@ -88,10 +110,29 @@ def process_frame(
     else:
         stats.record(ts, counts, alarms_this_frame)
 
+    # 目标详情（供检测页面板）：逐目标 + 逐类别计数（转成类名，便于人读）
+    names = result.names
+    targets = [
+        TargetInfo(
+            # 仅跟踪路径才有可信 track_id；图片源(use_tracking=False)一律 -1，
+            # 避免依赖 detector 端把 track_ids 留空这一隐含约定。
+            track_id=int(result.track_ids[i]) if (use_tracking and i < len(result.track_ids)) else -1,
+            cls_id=int(result.clss[i]),
+            cls_name=names.get(int(result.clss[i]), str(result.clss[i])),
+            conf=float(result.confs[i]),
+        )
+        for i in range(len(result.clss))
+    ]
+    details = FrameDetails(
+        targets=targets,
+        counts={names.get(cid, str(cid)): n for cid, n in counts.items()},
+    )
+
     return FrameOutcome(
         centers=centers,
         violator_indices=violator_indices,
         counts=counts,
         alarms_this_frame=alarms_this_frame,
         fired_alarms=fired,
+        details=details,
     )
