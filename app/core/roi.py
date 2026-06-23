@@ -14,11 +14,17 @@ from shapely.validation import make_valid
 
 @dataclass
 class RoiRegion:
-    """单个多边形 ROI。points 为像素坐标列表 [(x,y), ...]。"""
+    """单个多边形 ROI。points 为像素坐标列表 [(x,y), ...]。
+
+    color 为该 ROI 的显示颜色（hex 字符串，如 "#ef4444"），用于画布绘制与
+    区域列表的颜色块。新建时由 RoiManager.add 自动分配；旧数据无 color 时
+    用默认色。
+    """
 
     points: list[tuple[float, float]]
     roi_id: int
     label: str = ""
+    color: str = ""
     _polygon: Polygon | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -51,21 +57,50 @@ class RoiRegion:
     def valid(self) -> bool:
         return self._polygon is not None
 
+    @property
+    def area(self) -> float:
+        """多边形面积（像素²）。无效多边形返回 0。"""
+        if self._polygon is None:
+            return 0.0
+        try:
+            return float(self._polygon.area)
+        except Exception:
+            return 0.0
+
     def to_dict(self) -> dict:
-        return {"roi_id": self.roi_id, "label": self.label, "points": self.points}
+        return {"roi_id": self.roi_id, "label": self.label, "color": self.color, "points": self.points}
 
 
 class RoiManager:
     """管理多个 RoiRegion。提供 violators() 找出进入任意 ROI 的检测框索引。"""
+
+    # ROI 颜色调色板：每个新建 ROI 按顺序循环分配一个颜色，使相邻区域颜色区分明显。
+    # 选色兼顾明暗主题可读性，避开纯红（与违反报警框冲突）。
+    ROI_COLORS = [
+        "#3b82f6",  # 蓝
+        "#22c55e",  # 绿
+        "#f59e0b",  # 琥珀
+        "#a855f7",  # 紫
+        "#06b6d4",  # 青
+        "#ec4899",  # 粉
+        "#14b8a6",  # 蓝绿
+        "#eab308",  # 黄
+    ]
 
     def __init__(self) -> None:
         self._regions: list[RoiRegion] = []
         self._next_id: int = 1
 
     # ---- 增删查 ----
-    def add(self, points: list[tuple[float, float]], label: str = "") -> RoiRegion:
-        """添加一个多边形 ROI，返回新建的 RoiRegion。"""
-        region = RoiRegion(points=points, roi_id=self._next_id, label=label or f"ROI{self._next_id}")
+    def add(self, points: list[tuple[float, float]], label: str = "", color: str = "") -> RoiRegion:
+        """添加一个多边形 ROI，返回新建的 RoiRegion。
+
+        color 留空时按当前区域数量从 ROI_COLORS 循环取色，保证每个 ROI 颜色不同。
+        """
+        if not color:
+            color = self.ROI_COLORS[(len(self._regions)) % len(self.ROI_COLORS)]
+        region = RoiRegion(points=points, roi_id=self._next_id,
+                           label=label or f"ROI{self._next_id}", color=color)
         self._regions.append(region)
         self._next_id += 1
         return region
@@ -116,14 +151,18 @@ class RoiManager:
         return [r.to_dict() for r in self._regions]
 
     def from_list(self, data: list[dict]) -> None:
-        """从列表恢复（最大 roi_id 续号）。"""
+        """从列表恢复（最大 roi_id 续号）。
+
+        兼容旧数据：无 color 字段时按加载顺序从 ROI_COLORS 补色。
+        """
         self.clear()
         max_id = 0
-        for item in data:
+        for idx, item in enumerate(data):
             pts = [(float(x), float(y)) for x, y in item.get("points", [])]
             rid = int(item.get("roi_id", self._next_id))
             label = item.get("label", "")
-            region = RoiRegion(points=pts, roi_id=rid, label=label)
+            color = item.get("color", "") or self.ROI_COLORS[idx % len(self.ROI_COLORS)]
+            region = RoiRegion(points=pts, roi_id=rid, label=label, color=color)
             self._regions.append(region)
             max_id = max(max_id, rid)
         self._next_id = max_id + 1 if self._regions else 1

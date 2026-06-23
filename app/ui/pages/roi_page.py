@@ -146,7 +146,37 @@ class RoiPage(BasePage):
         self.canvas.set_rois(rois)
 
     def refresh_roi_list(self, regions) -> None:
-        """regions: list[RoiRegion]。"""
+        """regions: list[RoiRegion]。每项显示颜色块 + 标签 + 面积。"""
+        from PyQt5.QtGui import QPixmap, QPainter, QColor
+        from PyQt5.QtCore import Qt, QSize
+        from PyQt5.QtWidgets import QListWidgetItem
         self.roi_list.clear()
+        self.roi_list.setIconSize(QSize(14, 14))
         for r in regions:
-            self.roi_list.addItem(f"{r.label}  ({len(r.points)} 点)")
+            # 颜色块图标
+            color = r.color or "#3b82f6"
+            pm = QPixmap(14, 14)
+            pm.fill(Qt.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setBrush(QColor(color))
+            p.setPen(QColor(color))
+            p.drawRoundedRect(1, 1, 12, 12, 3, 3)
+            p.end()
+            # 面积格式化：像素²，大数值用 k/m
+            area = getattr(r, "area", 0.0)
+            area_str = self._fmt_area(area)
+            item = QListWidgetItem(f"{r.label}    {len(r.points)} 点    面积 {area_str}")
+            item.setIcon(QPixmap(pm))
+            self.roi_list.addItem(item)
+
+    @staticmethod
+    def _fmt_area(area: float) -> str:
+        """面积（像素²）格式化：大数值用 k/m 降量级。"""
+        if area <= 0:
+            return "0"
+        if area >= 1_000_000:
+            return f"{area/1_000_000:.2f}M px²"
+        if area >= 1_000:
+            return f"{area/1_000:.1f}k px²"
+        return f"{int(area)} px²"

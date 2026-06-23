@@ -99,16 +99,27 @@ class VideoCanvas(QLabel):
         self.setText("")
         self.update()
 
-    def set_rois(self, rois: List[List[Tuple[float, float]]]) -> None:
+    def set_rois(self, rois) -> None:
         """设置已有 ROI 列表（原始帧像素坐标）。
 
+        兼容两种格式：
+          - 旧版：[[points], ...]            （points 为 [(x,y),...]）
+          - 新版：[(points, color), ...]     （color 为 hex 字符串，如 "#3b82f6"）
         内容未变时跳过赋值与重绘（_on_frame 每帧都会调用，但 ROI 只在用户
         增删时变化，去抖可避免每帧多触发一次 update）。
+
+        内部统一存为 [(points, color)] 形式（color 为 "" 表示用默认色）。
         """
-        new_rois = [list(r) for r in rois]
-        if new_rois == self._rois:
+        normalized = []
+        for r in rois:
+            if isinstance(r, tuple) and len(r) == 2 and isinstance(r[0], list):
+                pts, color = r
+                normalized.append((list(pts), color or ""))
+            else:
+                normalized.append((list(r), ""))
+        if normalized == self._rois:
             return
-        self._rois = new_rois
+        self._rois = normalized
         self.update()
 
     def set_violators(
@@ -194,8 +205,8 @@ class VideoCanvas(QLabel):
         painter.drawPixmap(ox, oy, dw, dh, self._pixmap)
 
         # 画已有 ROI
-        for roi_pts in self._rois:
-            self._draw_roi(painter, roi_pts, ox, oy, dw, dh, alarm=False)
+        for roi_pts, roi_color in self._rois:
+            self._draw_roi(painter, roi_pts, ox, oy, dw, dh, alarm=False, color=roi_color)
 
         # 画违反目标红框（pen/brush 在循环外构造一次，避免每个框重复 new）
         pen = QPen(QColor(self._palette.alarm), 3)
@@ -226,7 +237,7 @@ class VideoCanvas(QLabel):
             painter.setFont(QFont("Microsoft YaHei", 10))
             painter.drawText(ox + 8, oy + 20, "点击添加顶点，双击/回车闭合，ESC 取消")
 
-    def _draw_roi(self, painter: QPainter, roi_pts, ox, oy, dw, dh, alarm: bool) -> None:
+    def _draw_roi(self, painter: QPainter, roi_pts, ox, oy, dw, dh, alarm: bool, color: str = "") -> None:
         if not roi_pts:
             return
         pw, ph = self._frame_size if self._frame_size != (0, 0) else (dw, dh)
@@ -235,10 +246,16 @@ class VideoCanvas(QLabel):
             sx = ox + fx / pw * dw if pw else fx
             sy = oy + fy / ph * dh if ph else fy
             poly.append(QPointF(sx, sy))
-        color = QColor(self._palette.alarm) if alarm else QColor(self._palette.primary)
-        fill = QColor(color)
+        # 颜色优先级：alarm 标记 > 指定 color > 默认 primary
+        if alarm:
+            base = QColor(self._palette.alarm)
+        elif color:
+            base = QColor(color)
+        else:
+            base = QColor(self._palette.primary)
+        fill = QColor(base)
         fill.setAlpha(60)
-        painter.setPen(QPen(color, 2))
+        painter.setPen(QPen(base, 2))
         painter.setBrush(QBrush(fill))
         painter.drawPolygon(poly)
 

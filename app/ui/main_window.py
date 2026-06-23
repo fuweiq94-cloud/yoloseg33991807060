@@ -587,7 +587,7 @@ class MainWindow(QMainWindow):
         # 切到 ROI 页时补一帧最近缓存，保证画布不是空白
         if self.stack.currentWidget() is self.page_roi and self._last_frame is not None:
             annotated, violator_indices, centers = self._last_frame
-            rois = [r.points for r in self._roi_manager.regions]
+            rois = [(r.points, r.color) for r in self._roi_manager.regions]
             self.page_roi.update_frame(annotated, violator_indices, centers)
             self.page_roi.set_rois(rois)
 
@@ -832,7 +832,7 @@ class MainWindow(QMainWindow):
     # Worker 信号 -> 路由到页面
     # ====================================================================
     def _on_frame(self, annotated: np.ndarray, violator_indices, centers) -> None:
-        rois = [r.points for r in self._roi_manager.regions]
+        rois = [(r.points, r.color) for r in self._roi_manager.regions]
         # 缓存最近一帧（切到 ROI 页时补帧用）
         self._last_frame = (annotated, violator_indices, centers)
         # 只给当前可见页喂帧：隐藏页的 VideoCanvas 不做昂贵的 np→QImage→QPixmap 转换，
@@ -1062,7 +1062,7 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText("已清除所有 ROI")
 
     def _refresh_roi_views(self) -> None:
-        rois = [r.points for r in self._roi_manager.regions]
+        rois = [(r.points, r.color) for r in self._roi_manager.regions]
         self.page_detection.set_rois(rois)
         self.page_roi.set_rois(rois)
         self.page_roi.refresh_roi_list(self._roi_manager.regions)
